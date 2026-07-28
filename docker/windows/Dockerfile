@@ -169,9 +169,19 @@ RUN set -eux; \
            --enable-encoder=h264_amf \
            --enable-encoder=hevc_amf ) \
       --extra-cflags="-Os -ffunction-sections -fdata-sections" \
-      --extra-ldflags="-Wl,--gc-sections"
+      --extra-ldflags="-Wl,--gc-sections -static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
 
 RUN make -j"$(nproc)" && make install
+
+# ffmpeg.exe dynamically loads libopenh264-*.dll at runtime (--enable-libopenh264
+# links it as a shared library, not statically), but `make install` only
+# installs FFmpeg's own libraries into --prefix=/dist -- it doesn't pull in
+# openh264's .dll from the mingw sysroot. Without this, ffmpeg.exe fails to
+# start with "libopenh264-7.dll not found" as soon as it's moved outside the
+# build container.
+RUN set -eux; \
+    if [ "$ARCH" = "amd64" ]; then MINGW_PREFIX=x86_64-w64-mingw32; else MINGW_PREFIX=aarch64-w64-mingw32; fi; \
+    cp "/usr/${MINGW_PREFIX}/lib/libopenh264"*.dll /dist/bin/
 
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then STRIP=x86_64-w64-mingw32-strip; else STRIP=aarch64-w64-mingw32-strip; fi; \
