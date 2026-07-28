@@ -101,6 +101,22 @@ GitHub Release として自動公開する（バイナリ + `SHA256SUMS.txt`）�
 につながる。同じバージョンブランチに新しいコミットが積まれた場合はタグを
 上書き（force push）して最新化する。
 
+## GitHub Release の成果物
+
+各プラットフォームにつき2種類の zip が公開される:
+
+- `ffmpeg-<platform>-<arch>.zip` — フル版。`bin/`・`lib/`（共有ライブラリ）に加え
+  `include/`（ヘッダ）・`share/`・pkgconfig 等、libav* を使った開発に必要な
+  ファイル一式を含む
+- `ffmpeg-<platform>-<arch>-binary-only.zip` — `bin/` ディレクトリの中身のみ
+  （Windows の `.lib` インポートライブラリは除く）
+
+**注意**: `-binary-only` パッケージは Linux/macOS では単体では実行できない。
+`ffmpeg` は `lib/*.so`（Linux）/ `lib/*.dylib`（macOS）に動的リンクされているため、
+それらの共有ライブラリが実行時に見つかる場所（フル版から取り出すか、システムの
+ライブラリパスに配置）に無いと起動に失敗する。Windows は DLL が `bin/` に
+同居しているため `-binary-only` だけで動作する。
+
 ## 成果物の検証
 
 各プラットフォームの `dist/<platform>/<arch>/` には `SHA256SUMS.txt` が同梱される
