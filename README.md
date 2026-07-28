@@ -50,12 +50,32 @@ macOS は Apple のライセンス上 Docker/Linux 上でのクロスビルド�
 
 ## ライセンス
 
+このリポジトリがビルドする `ffmpeg` バイナリは **LGPL version 2.1 or later**
+でビルドされている（全プラットフォームの configure で `--enable-gpl` は
+一切指定していない。configure 実行時の出力にも `License: LGPL version 2.1
+or later` と表示される）。
+
 LGPL を維持するため、GPL コーデックの libx264/libx265 は使わない。H.264 の
 ソフトウェアエンコードが必要な場面（HW エンコーダが使えない環境向けの
 フォールバック）には BSD ライセンスの [openh264](https://github.com/cisco/openh264)
 (`libopenh264`) を全プラットフォームに同梱している。H.265 のオープンな
 ソフトウェアエンコーダ実装は実用的な選択肢が無い（主要実装の x265 は GPL）ため、
 H.265 は各プラットフォームのハードウェアエンコーダのみで対応する。
+
+組み込んでいる外部コンポーネントとそのライセンス:
+
+| コンポーネント | ライセンス | 備考 |
+|---|---|---|
+| openh264 (Cisco) | BSD-2-Clause | H.264 ソフトウェアエンコーダ(フォールバック) |
+| nv-codec-headers | MIT | NVENC 用ヘッダのみ、ライブラリ実体は非搭載 |
+| Intel libvpl (oneVPL) | MIT | QSV 用ヘッダ/ローダのみ |
+| AMD AMF ヘッダ | MIT | AMF 用ヘッダのみ |
+| libva (VA-API) | MIT | ヘッダ/ローダのみ |
+| VideoToolbox | Apple OS フレームワーク | macOS のみ、ライセンス対象外 |
+
+いずれも LGPL と両立するライセンスであり、GPL コーデックは含まれない。また
+全プラットフォームで `--enable-shared --disable-static`（静的リンクなし）
+でビルドしており、LGPL が要求する動的リンクの要件を満たしている。
 
 ## ローカルでビルドする
 
