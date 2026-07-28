@@ -17,10 +17,14 @@ command -v brew >/dev/null 2>&1 || { echo "Homebrew is required" >&2; exit 1; }
 brew install nasm pkg-config meson ninja
 
 # openh264 (BSD-licensed H.264 software encoder), used as a fallback encoder
-# alongside VideoToolbox.
+# alongside VideoToolbox. Installed into a local prefix rather than
+# /usr/local, which the GitHub Actions macos runner user cannot write to.
+OPENH264_PREFIX="${BUILD_TMP}/openh264-install"
 git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git "${BUILD_TMP}/openh264"
-meson setup "${BUILD_TMP}/openh264/build" "${BUILD_TMP}/openh264" --prefix=/usr/local
+meson setup "${BUILD_TMP}/openh264/build" "${BUILD_TMP}/openh264" --prefix="$OPENH264_PREFIX" --libdir=lib
 ninja -C "${BUILD_TMP}/openh264/build" install
+
+export PKG_CONFIG_PATH="${OPENH264_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 cd "$FFMPEG_SRC"
 
@@ -72,7 +76,7 @@ cd "$FFMPEG_SRC"
   --enable-encoder=hevc_videotoolbox \
   --enable-encoder=libopenh264 \
   --extra-cflags="-Os -ffunction-sections -fdata-sections" \
-  --extra-ldflags="-Wl,-dead_strip"
+  --extra-ldflags="-Wl,-dead_strip -L${OPENH264_PREFIX}/lib -Wl,-rpath,${OPENH264_PREFIX}/lib"
 
 make -j"$(sysctl -n hw.ncpu)"
 make install
