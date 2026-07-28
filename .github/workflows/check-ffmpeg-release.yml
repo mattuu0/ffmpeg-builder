@@ -1,0 +1,65 @@
+name: Check for new FFmpeg release
+
+# Runs daily, compares the latest stable release tag on the upstream FFmpeg
+# repo (github.com/FFmpeg/FFmpeg) against the commit currently pinned by the
+# ffmpeg-src submodule. If a newer release tag exists, updates the submodule
+# to point at it, commits that change, and pushes — which in turn triggers
+# build.yml (via push) to build binaries for the new release.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Find latest stable release tag upstream
+        id: latest
+        run: |
+          # Upstream FFmpeg release tags look like "n7.1", "n7.1.1", "n8.0", etc.
+          # Filter out pre-releases (alpha/beta/rc) and sort by version.
+          latest_tag=$(git -C ffmpeg-src ls-remote --tags --refs origin \
+            | awk -F'refs/tags/' '{print $2}' \
+            | grep -E '^n[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+            | sort -V \
+            | tail -n1)
+          if [ -z "$latest_tag" ]; then
+            echo "Could not determine latest stable tag" >&2
+            exit 1
+          fi
+          echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "Latest stable upstream tag: $latest_tag"
+
+      - name: Check current submodule reference
+        id: current
+        run: |
+          cd ffmpeg-src
+          current_tag=$(git describe --tags --exact-match 2>/dev/null || echo "")
+          echo "tag=$current_tag" >> "$GITHUB_OUTPUT"
+          echo "Current submodule tag: ${current_tag:-<none, not on a tag>}"
+
+      - name: Update submodule to latest stable tag
+        if: steps.latest.outputs.tag != steps.current.outputs.tag
+        run: |
+          cd ffmpeg-src
+          git fetch --depth 1 origin "refs/tags/${{ steps.latest.outputs.tag }}"
+          git checkout "${{ steps.latest.outputs.tag }}"
+
+      - name: Commit and push submodule update
+        if: steps.latest.outputs.tag != steps.current.outputs.tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ffmpeg-src
+          git commit -m "Update ffmpeg-src to ${{ steps.latest.outputs.tag }}"
+          git tag "v${{ steps.latest.outputs.tag }}"
+          git push origin HEAD:${{ github.ref_name }}
+          git push origin "v${{ steps.latest.outputs.tag }}"

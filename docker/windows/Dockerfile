@@ -1,0 +1,164 @@
+FROM debian:bookworm-slim
+
+ARG ARCH=amd64
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential \
+    cmake \
+    meson \
+    ninja-build \
+    pkg-config \
+    yasm \
+    nasm \
+    git \
+    curl \
+    ca-certificates \
+    gcc-mingw-w64-x86-64 \
+    g++-mingw-w64-x86-64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# gcc-mingw-w64-aarch64 is not available on Ubuntu 22.04's apt repos as of
+# this writing. Fall back to llvm-mingw (prebuilt toolchain release) for the
+# arm64 target when requested.
+RUN set -eux; \
+    if [ "$ARCH" = "arm64" ]; then \
+      apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y xz-utils jq && rm -rf /var/lib/apt/lists/*; \
+      LLVM_MINGW_URL=$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+        | jq -r '.assets[] | select(.name | test("ucrt-ubuntu-22.04-x86_64.tar.xz$")) | .browser_download_url'); \
+      curl -L -o /tmp/llvm-mingw.tar.xz "$LLVM_MINGW_URL"; \
+      mkdir -p /opt/llvm-mingw; \
+      tar -xJf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1; \
+      rm /tmp/llvm-mingw.tar.xz; \
+    fi
+ENV PATH="/opt/llvm-mingw/bin:${PATH}"
+
+# Use the posix-threads mingw-w64 gcc variant (not win32-threads) so that
+# -pthread / pthreads support is available, which FFmpeg's build requires.
+RUN set -eux; \
+    if [ "$ARCH" = "amd64" ]; then \
+      update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix; \
+      update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix; \
+    fi
+
+WORKDIR /build
+
+# NVIDIA NVENC headers (header-only, amd64 target only)
+RUN git clone --depth 1 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nv-codec-headers \
+    && make -C /tmp/nv-codec-headers PREFIX=/usr/x86_64-w64-mingw32 install \
+    && rm -rf /tmp/nv-codec-headers
+
+# AMD AMF headers (header-only, amd64 target only)
+RUN git clone --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git /tmp/AMF \
+    && mkdir -p /usr/x86_64-w64-mingw32/include/AMF \
+    && cp -r /tmp/AMF/amf/public/include/* /usr/x86_64-w64-mingw32/include/AMF/ \
+    && rm -rf /tmp/AMF
+
+# openh264 (BSD-licensed H.264 software encoder), cross-built for mingw as a
+# fallback encoder on every Windows target.
+RUN set -eux; \
+    if [ "$ARCH" = "amd64" ]; then \
+      MINGW_PREFIX=x86_64-w64-mingw32; \
+    else \
+      MINGW_PREFIX=aarch64-w64-mingw32; \
+    fi; \
+    printf '%s\n' \
+      "[binaries]" \
+      "c = '${MINGW_PREFIX}-gcc'" \
+      "cpp = '${MINGW_PREFIX}-g++'" \
+      "ar = '${MINGW_PREFIX}-ar'" \
+      "strip = '${MINGW_PREFIX}-strip'" \
+      "windres = '${MINGW_PREFIX}-windres'" \
+      "pkg-config = 'pkg-config'" \
+      "[host_machine]" \
+      "system = 'windows'" \
+      "cpu_family = '$( [ "$ARCH" = "amd64" ] && echo x86_64 || echo aarch64 )'" \
+      "cpu = '$( [ "$ARCH" = "amd64" ] && echo x86_64 || echo aarch64 )'" \
+      "endian = 'little'" \
+      > /tmp/mingw-cross.ini; \
+    git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git /tmp/openh264; \
+    cd /tmp/openh264; \
+    meson setup build --cross-file /tmp/mingw-cross.ini --prefix="/usr/${MINGW_PREFIX}" --libdir=lib; \
+    ninja -C build install; \
+    cd /build && rm -rf /tmp/openh264 /tmp/mingw-cross.ini
+
+COPY ffmpeg-src/ /build/
+
+# ---------------------------------------------------------------------------
+# configure flags — edit below to add/remove features for the Windows build.
+#
+# Minimal build: H.264/H.265 hardware encode + openh264 (H.264 software)
+# fallback, no audio, no software decoders. QSV (libvpl) cross-build for
+# mingw is not wired up here — it needs a Windows-targeted libvpl build,
+# which is nontrivial to cross-compile. VAAPI is Linux-only, excluded.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    if [ "$ARCH" = "amd64" ]; then \
+      CROSS_PREFIX=x86_64-w64-mingw32-; \
+      TARGET_ARCH=x86_64; \
+      MINGW_PREFIX=x86_64-w64-mingw32; \
+    elif [ "$ARCH" = "arm64" ]; then \
+      CROSS_PREFIX=aarch64-w64-mingw32-; \
+      TARGET_ARCH=aarch64; \
+      MINGW_PREFIX=aarch64-w64-mingw32; \
+    else \
+      echo "Unsupported ARCH: $ARCH" >&2; exit 1; \
+    fi; \
+    export PKG_CONFIG_LIBDIR="/usr/${MINGW_PREFIX}/lib/pkgconfig"; \
+    export PKG_CONFIG_PATH=; \
+    ./configure \
+      --prefix=/dist \
+      --target-os=mingw32 \
+      --arch="$TARGET_ARCH" \
+      --cross-prefix="$CROSS_PREFIX" \
+      --enable-cross-compile \
+      --pkg-config=pkg-config \
+      --enable-shared \
+      --disable-static \
+      --disable-everything \
+      --disable-ffprobe \
+      --disable-ffplay \
+      --disable-doc \
+      --disable-htmlpages \
+      --disable-manpages \
+      --disable-podpages \
+      --disable-txtpages \
+      --disable-debug \
+      --enable-d3d11va \
+      --enable-filter=ddagrab \
+      --enable-protocol=file \
+      --enable-protocol=pipe \
+      --enable-protocol=tcp \
+      --enable-protocol=udp \
+      --enable-protocol=rtmp \
+      --enable-protocol=rtp \
+      --enable-demuxer=rawvideo \
+      --enable-muxer=rawvideo \
+      --enable-muxer=mp4 \
+      --enable-muxer=mov \
+      --enable-muxer=matroska \
+      --enable-muxer=mpegts \
+      --enable-muxer=flv \
+      --enable-parser=h264 \
+      --enable-parser=hevc \
+      --enable-bsf=h264_mp4toannexb \
+      --enable-bsf=hevc_mp4toannexb \
+      --enable-filter=scale \
+      --enable-filter=format \
+      --enable-filter=null \
+      --enable-libopenh264 \
+      --enable-encoder=libopenh264 \
+      $( [ "$ARCH" = "amd64" ] && echo \
+           --enable-ffnvcodec \
+           --enable-amf \
+           --enable-encoder=h264_nvenc \
+           --enable-encoder=hevc_nvenc \
+           --enable-encoder=h264_amf \
+           --enable-encoder=hevc_amf ) \
+      --extra-cflags="-Os -ffunction-sections -fdata-sections" \
+      --extra-ldflags="-Wl,--gc-sections"
+
+RUN make -j"$(nproc)" && make install
+
+RUN set -eux; \
+    if [ "$ARCH" = "amd64" ]; then STRIP=x86_64-w64-mingw32-strip; else STRIP=aarch64-w64-mingw32-strip; fi; \
+    "$STRIP" --strip-unneeded /dist/bin/* /dist/lib/*.dll || true

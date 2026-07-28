@@ -1,0 +1,12 @@
+.git
+ffmpeg-src/.git
+dist
+build
+ffmpeg-src/build
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
