@@ -181,7 +181,7 @@ RUN make -j"$(nproc)" && make install
 # build container.
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then MINGW_PREFIX=x86_64-w64-mingw32; else MINGW_PREFIX=aarch64-w64-mingw32; fi; \
-    cp "/usr/${MINGW_PREFIX}/lib/libopenh264"*.dll /dist/bin/
+    cp "/usr/${MINGW_PREFIX}/bin/libopenh264"*.dll /dist/bin/
 
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then STRIP=x86_64-w64-mingw32-strip; else STRIP=aarch64-w64-mingw32-strip; fi; \
