@@ -71,7 +71,14 @@ jobs:
             # workflow_dispatch (or any non-tag trigger): derive the tag from
             # whatever version ffmpeg-src is currently checked out at, so the
             # release always reflects the FFmpeg version actually built.
-            ffmpeg_ref=$(cd ffmpeg-src && (git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD))
+            # Prefer an exact tag match, then FFmpeg's own RELEASE file
+            # (e.g. "7.1" for a release branch checkout), then fall back to
+            # the short commit hash.
+            ffmpeg_ref=$(cd ffmpeg-src && ( \
+              git describe --tags --exact-match 2>/dev/null \
+              || (test -f RELEASE && cat RELEASE) \
+              || git rev-parse --short HEAD \
+            ))
             echo "tag=v${ffmpeg_ref}" >> "$GITHUB_OUTPUT"
           fi
 

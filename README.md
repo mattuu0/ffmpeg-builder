@@ -90,13 +90,16 @@ GitHub Release として自動公開する（バイナリ + `SHA256SUMS.txt`）�
 
 ### 自動リリース検知 (`check-ffmpeg-release.yml`)
 
-毎日 UTC 3:00 に実行され、upstream FFmpeg (github.com/FFmpeg/FFmpeg) の最新
-安定版リリースタグ（`n7.1` 等の `n<major>.<minor>[.<patch>]` 形式、alpha/beta/rc
-は除外）と、現在 `ffmpeg-src` submodule が指しているコミットを比較する。新しい
-安定版タグが出ていれば、submodule をそのタグへ更新してコミット・push し、
-このリポジトリ側に `v<タグ名>` のタグを打つ。これが `build.yml` の
-`push: tags: v*` トリガーとなり、新しい FFmpeg バージョンでの自動ビルド・
-自動リリースにつながる。
+毎日 UTC 3:00 に実行され、upstream FFmpeg (github.com/FFmpeg/FFmpeg) の
+`release/<major>.<minor>` ブランチ（例: `release/7.1`）のうち最もバージョン
+番号が大きいものを探し、その最新コミットと現在 `ffmpeg-src` submodule が
+指しているコミットを比較する。新しいコミットがあれば（新しい release
+ブランチが出た場合も、同じブランチにパッチが積まれた場合も）、submodule
+をそのブランチの最新コミットへ更新してコミット・push し、このリポジトリ
+側に `v<バージョン番号>`（例: `v7.1`）のタグを打つ。これが `build.yml` の
+`push: tags: v*` トリガーとなり、そのバージョンでの自動ビルド・自動リリース
+につながる。同じバージョンブランチに新しいコミットが積まれた場合はタグを
+上書き（force push）して最新化する。
 
 ## 成果物の検証
 

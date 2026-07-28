@@ -1,10 +1,12 @@
 name: Check for new FFmpeg release
 
-# Runs daily, compares the latest stable release tag on the upstream FFmpeg
-# repo (github.com/FFmpeg/FFmpeg) against the commit currently pinned by the
-# ffmpeg-src submodule. If a newer release tag exists, updates the submodule
-# to point at it, commits that change, and pushes — which in turn triggers
-# build.yml (via push) to build binaries for the new release.
+# Runs daily. Finds the highest-numbered release/<version> branch on the
+# upstream FFmpeg repo (github.com/FFmpeg/FFmpeg) — e.g. release/7.1 — and
+# compares its latest commit against what the ffmpeg-src submodule currently
+# points at. If there's a newer commit (either a new release branch, or a new
+# commit on the same branch), updates the submodule, commits that change,
+# and tags this repo with the FFmpeg version — which triggers build.yml
+# (via the tag push) to build and release binaries for that version.
 on:
   schedule:
     - cron: "0 3 * * *"
@@ -21,46 +23,50 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Find latest stable release tag upstream
+      - name: Find latest release branch upstream
         id: latest
         run: |
-          # Upstream FFmpeg release tags look like "n7.1", "n7.1.1", "n8.0", etc.
-          # Filter out pre-releases (alpha/beta/rc) and sort by version.
-          latest_tag=$(git -C ffmpeg-src ls-remote --tags --refs origin \
-            | awk -F'refs/tags/' '{print $2}' \
-            | grep -E '^n[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+          # Upstream branches look like "release/7.1", "release/6.1", etc.
+          # Pick the highest version number.
+          latest_branch=$(git -C ffmpeg-src ls-remote --heads origin \
+            | awk -F'refs/heads/' '{print $2}' \
+            | grep -E '^release/[0-9]+\.[0-9]+$' \
+            | sed 's#release/##' \
             | sort -V \
             | tail -n1)
-          if [ -z "$latest_tag" ]; then
-            echo "Could not determine latest stable tag" >&2
+          if [ -z "$latest_branch" ]; then
+            echo "Could not determine latest release/* branch" >&2
             exit 1
           fi
-          echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
-          echo "Latest stable upstream tag: $latest_tag"
+          latest_sha=$(git -C ffmpeg-src ls-remote origin "refs/heads/release/${latest_branch}" | cut -f1)
+          echo "version=$latest_branch" >> "$GITHUB_OUTPUT"
+          echo "sha=$latest_sha" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release branch: release/${latest_branch} @ ${latest_sha}"
 
-      - name: Check current submodule reference
+      - name: Check current submodule commit
         id: current
         run: |
-          cd ffmpeg-src
-          current_tag=$(git describe --tags --exact-match 2>/dev/null || echo "")
-          echo "tag=$current_tag" >> "$GITHUB_OUTPUT"
-          echo "Current submodule tag: ${current_tag:-<none, not on a tag>}"
+          current_sha=$(git -C ffmpeg-src rev-parse HEAD)
+          echo "sha=$current_sha" >> "$GITHUB_OUTPUT"
+          echo "Current submodule commit: $current_sha"
 
-      - name: Update submodule to latest stable tag
-        if: steps.latest.outputs.tag != steps.current.outputs.tag
+      - name: Update submodule to latest release branch head
+        if: steps.latest.outputs.sha != steps.current.outputs.sha
         run: |
           cd ffmpeg-src
-          git fetch --depth 1 origin "refs/tags/${{ steps.latest.outputs.tag }}"
-          git checkout "${{ steps.latest.outputs.tag }}"
+          git fetch --depth 1 origin "refs/heads/release/${{ steps.latest.outputs.version }}"
+          git checkout FETCH_HEAD
 
       - name: Commit and push submodule update
-        if: steps.latest.outputs.tag != steps.current.outputs.tag
+        if: steps.latest.outputs.sha != steps.current.outputs.sha
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add ffmpeg-src
-          git commit -m "Update ffmpeg-src to ${{ steps.latest.outputs.tag }}"
-          git tag "v${{ steps.latest.outputs.tag }}"
+          git commit -m "Update ffmpeg-src to release/${{ steps.latest.outputs.version }} (${{ steps.latest.outputs.sha }})"
           git push origin HEAD:${{ github.ref_name }}
-          git push origin "v${{ steps.latest.outputs.tag }}"
-
+          # Tag with the FFmpeg version so build.yml's tag-push trigger fires
+          # and the release derives its name from this version. Re-running
+          # against the same branch with new commits moves the tag forward.
+          git tag -f "v${{ steps.latest.outputs.version }}"
+          git push origin "v${{ steps.latest.outputs.version }}" --force
