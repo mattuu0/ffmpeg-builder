@@ -96,25 +96,16 @@ jobs:
             # share — headers/import libs for development use, etc).
             (cd "$dir" && zip -r "../../release/${name}.zip" .)
 
-            # Binary-only package: everything under bin/ (the ffmpeg
-            # executable, and on Windows the DLLs that live alongside it),
-            # plus the shared libraries under lib/ needed at runtime
-            # (.so/.so.*/.dylib, including the symlinks ffmpeg resolves
-            # SONAMEs through). Drops include/, share/, pkgconfig/, and
-            # Windows .lib import libraries, which are only needed for
-            # development against libav*, not for running ffmpeg.
+            # Binary-only package: just bin/ (the ffmpeg executable, and on
+            # Windows the DLLs that live alongside it), minus Windows .lib
+            # import libraries which aren't needed to run ffmpeg. Drops
+            # lib/, include/, share/ entirely — only needed for developing
+            # against libav*, not for running ffmpeg.
             binary_only_dir="$(mktemp -d)/${name}"
             mkdir -p "$binary_only_dir"
             if [ -d "${dir}bin" ]; then
               cp -r "${dir}bin" "$binary_only_dir/"
               find "$binary_only_dir/bin" -maxdepth 1 -name '*.lib' -delete
-            fi
-            if [ -d "${dir}lib" ]; then
-              mkdir -p "$binary_only_dir/lib"
-              find "${dir}lib" -maxdepth 1 \( -type f -o -type l \) \
-                \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) \
-                -exec cp -P {} "$binary_only_dir/lib/" \;
-              [ -z "$(ls -A "$binary_only_dir/lib")" ] && rmdir "$binary_only_dir/lib"
             fi
             [ -f "${dir}SHA256SUMS.txt" ] && cp "${dir}SHA256SUMS.txt" "$binary_only_dir/"
             (cd "$(dirname "$binary_only_dir")" && zip -r "${GITHUB_WORKSPACE}/release/${name}-binary-only.zip" "$name")
