@@ -57,6 +57,31 @@ jobs:
           git fetch --depth 1 origin "refs/heads/release/${{ steps.latest.outputs.version }}"
           git checkout FETCH_HEAD
 
+      # Verify every patch in patches/ still applies cleanly against the new
+      # submodule commit BEFORE committing the bump. If a patch (e.g.
+      # ddagrab-uac-recovery.patch) no longer applies, upstream changed the
+      # surrounding code enough to need a manual rebase — fail here instead
+      # of silently committing a submodule bump that build.yml would later
+      # reject (or worse, silently ship unpatched if the check were ever
+      # loosened on the Dockerfile side).
+      - name: Verify source patches still apply
+        if: steps.latest.outputs.sha != steps.current.outputs.sha
+        run: |
+          fail=0
+          for patch in patches/*.patch; do
+            [ -e "$patch" ] || continue
+            echo "Checking $patch against release/${{ steps.latest.outputs.version }} (${{ steps.latest.outputs.sha }})..."
+            if ! git -C ffmpeg-src apply --check "../$patch"; then
+              echo "::error::$patch no longer applies cleanly to ffmpeg-src @ release/${{ steps.latest.outputs.version }}. Manual rebase required before this submodule bump can be merged." >&2
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Discarding submodule bump; patches need a manual rebase first." >&2
+            git -C ffmpeg-src checkout "${{ steps.current.outputs.sha }}"
+            exit 1
+          fi
+
       - name: Commit and push submodule update
         if: steps.latest.outputs.sha != steps.current.outputs.sha
         run: |

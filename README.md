@@ -21,6 +21,7 @@ docker/       Linux・Windows 向け Dockerfile とビルドラッパー
 macos/        macOS 向けネイティブビルドスクリプト (Docker不使用)
 .github/      GitHub Actions ワークフロー
 ffmpeg-src/   FFmpeg本体ソース (git submodule → github.com/FFmpeg/FFmpeg)
+patches/      ffmpeg-src に当てるソースパッチ (ビルドのたびに fresh に適用)
 dist/         ビルド成果物の出力先 (gitignore対象)
 ```
 
@@ -172,6 +173,18 @@ sha256sum -c SHA256SUMS.txt
 | Apple VideoToolbox (h264/hevc) | 非対応 | 非対応 | 対応 |
 | openh264 (h264, ソフトウェア) | 全アーキ (フォールバック) | 全アーキ (フォールバック) | 対応 (フォールバック) |
 | 画面キャプチャ | xcbgrab (amd64) / kmsgrab (全アーキ) | ddagrab フィルタ (全アーキ) | avfoundation |
+
+Windows の ddagrab には、UAC の同意プロンプト表示（secure desktop /
+Winlogon への遷移）を挟むと `IDXGIOutputDuplication` が無効化され、通常は
+キャプチャが致命的に停止してしまう既知の問題がある。このリポジトリでは
+`patches/ddagrab-uac-recovery.patch` を Windows ビルド時（`docker/windows/
+Dockerfile`）に自動適用し、`DXGI_ERROR_ACCESS_LOST`/`E_ACCESSDENIED`/
+`DXGI_ERROR_INVALID_CALL` 検知時に同じデバイス・同じ出力インデックスで
+duplication を再構築してキャプチャを継続させる。`ffmpeg-src` は git
+submodule のため、パッチは submodule には焼き込まず、ビルドのたびに
+`patches/` から適用される（`check-ffmpeg-release.yml` による日次の
+submodule 更新後も自動的に当たり直る）。アップストリームの変更でパッチが
+当たらなくなった場合はビルドが `FATAL:` メッセージ付きで失敗する。
 
 ビルド自体は各ベンダーのヘッダファイルのみで完結し、実行時に対応する GPU ドライバ
 (NVIDIA ドライバ、Intel メディアドライバ、Mesa の VA-API ドライバ等) が無いと

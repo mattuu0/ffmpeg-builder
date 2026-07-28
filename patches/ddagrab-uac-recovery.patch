@@ -1,0 +1,173 @@
+diff --git a/libavfilter/vsrc_ddagrab.c b/libavfilter/vsrc_ddagrab.c
+index e035ac9bc4..c526df368d 100644
+--- a/libavfilter/vsrc_ddagrab.c
++++ b/libavfilter/vsrc_ddagrab.c
+@@ -65,6 +65,7 @@ typedef struct DdagrabContext {
+ 
+     DXGI_OUTPUT_DESC output_desc;
+     IDXGIOutputDuplication *dxgi_outdupl;
++    int recovery_attempts;
+     AVFrame *last_frame;
+ 
+     int mouse_x, mouse_y;
+@@ -322,6 +323,117 @@ static av_cold int init_dxgi_dda(AVFilterContext *avctx)
+     return 0;
+ }
+ 
++/*
++ * Recreate dda->dxgi_outdupl after the duplication has been invalidated by a
++ * transition away from the input desktop (e.g. a UAC consent prompt
++ * switching to the secure desktop / Winlogon), which surfaces as
++ * DXGI_ERROR_ACCESS_LOST / E_ACCESSDENIED / DXGI_ERROR_INVALID_CALL from
++ * AcquireNextFrame or ReleaseFrame.
++ *
++ * Reuses dda->device_hwctx->device rather than creating a new ID3D11Device:
++ * later CopySubresourceRegion/CopyResource calls use this filter's own
++ * device_context, so a duplication built against a different device would
++ * silently fail to copy. The IDXGIAdapter and IDXGIOutput are always
++ * re-fetched fresh (never cached) because virtual-display adapters (e.g.
++ * remote-desktop drivers) can get a new PnP instance across a desktop
++ * switch; a stale IDXGIAdapter can still report success from
++ * DuplicateOutput(1) while being non-functional. The old duplication object
++ * is released before the new one is created (drop-then-recreate ordering)
++ * since only one live IDXGIOutputDuplication may exist per output at a
++ * time.
++ */
++static int recover_duplication(AVFilterContext *avctx)
++{
++    DdagrabContext *dda = avctx->priv;
++    IDXGIDevice *dxgi_device = NULL;
++    IDXGIAdapter *dxgi_adapter = NULL;
++    IDXGIOutput *dxgi_output = NULL;
++    IDXGIOutput1 *dxgi_output1 = NULL;
++#if HAVE_IDXGIOUTPUT5
++    IDXGIOutput5 *dxgi_output5 = NULL;
++#endif
++    HRESULT hr;
++
++    /* Re-attach this thread to whatever is currently the input desktop:
++     * a cached desktop attachment from before the UAC transition is not
++     * valid for talking to the (now restored) user desktop. */
++    HDESK input_desktop = OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP | GENERIC_ALL);
++    if (input_desktop) {
++        SetThreadDesktop(input_desktop);
++        CloseDesktop(input_desktop);
++    }
++
++    release_resource(&dda->dxgi_outdupl);
++
++    hr = ID3D11Device_QueryInterface(dda->device_hwctx->device, &IID_IDXGIDevice, (void**)&dxgi_device);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "recover_duplication: Failed querying IDXGIDevice: %lx\n", hr);
++        return AVERROR_EXTERNAL;
++    }
++
++    hr = IDXGIDevice_GetParent(dxgi_device, &IID_IDXGIAdapter, (void**)&dxgi_adapter);
++    IDXGIDevice_Release(dxgi_device);
++    dxgi_device = NULL;
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "recover_duplication: Failed getting parent IDXGIAdapter: %lx\n", hr);
++        return AVERROR_EXTERNAL;
++    }
++
++    hr = IDXGIAdapter_EnumOutputs(dxgi_adapter, dda->output_idx, &dxgi_output);
++    IDXGIAdapter_Release(dxgi_adapter);
++    dxgi_adapter = NULL;
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "recover_duplication: Failed to enumerate DXGI output %d: %lx\n", dda->output_idx, hr);
++        return AVERROR_EXTERNAL;
++    }
++
++#if HAVE_IDXGIOUTPUT5
++    hr = IDXGIOutput_QueryInterface(dxgi_output, &IID_IDXGIOutput5, (void**)&dxgi_output5);
++    if (SUCCEEDED(hr)) {
++        DXGI_FORMAT formats[] = { DXGI_FORMAT_B8G8R8A8_UNORM };
++
++        release_resource(&dxgi_output);
++
++        hr = IDXGIOutput5_DuplicateOutput1(dxgi_output5,
++            (IUnknown*)dda->device_hwctx->device,
++            0,
++            FF_ARRAY_ELEMS(formats),
++            formats,
++            &dda->dxgi_outdupl);
++        release_resource(&dxgi_output5);
++
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "recover_duplication: DuplicateOutput1 failed: %lx\n", hr);
++            return AVERROR_EXTERNAL;
++        }
++
++        av_log(avctx, AV_LOG_VERBOSE, "recover_duplication: recovered via IDXGIOutput5\n");
++        return 0;
++    }
++#endif
++
++    hr = IDXGIOutput_QueryInterface(dxgi_output, &IID_IDXGIOutput1, (void**)&dxgi_output1);
++    release_resource(&dxgi_output);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "recover_duplication: Failed querying IDXGIOutput1: %lx\n", hr);
++        return AVERROR_EXTERNAL;
++    }
++
++    hr = IDXGIOutput1_DuplicateOutput(dxgi_output1,
++        (IUnknown*)dda->device_hwctx->device,
++        &dda->dxgi_outdupl);
++    release_resource(&dxgi_output1);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "recover_duplication: DuplicateOutput failed: %lx\n", hr);
++        return AVERROR_EXTERNAL;
++    }
++
++    av_log(avctx, AV_LOG_VERBOSE, "recover_duplication: recovered via IDXGIOutput1\n");
++    return 0;
++}
++
++#define DDAGRAB_MAX_RECOVERY_ATTEMPTS 8
++
+ typedef struct ConstBufferData
+ {
+     float width;
+@@ -699,10 +811,20 @@ static int next_frame_internal(AVFilterContext *avctx, ID3D11Texture2D **desktop
+         &desktop_resource);
+     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+         return AVERROR(EAGAIN);
++    } else if ((hr == DXGI_ERROR_ACCESS_LOST || hr == E_ACCESSDENIED || hr == DXGI_ERROR_INVALID_CALL) &&
++               dda->recovery_attempts < DDAGRAB_MAX_RECOVERY_ATTEMPTS) {
++        av_log(avctx, AV_LOG_WARNING,
++               "AcquireNextFrame lost desktop duplication (%lx), attempting recovery (%d/%d)\n",
++               hr, dda->recovery_attempts + 1, DDAGRAB_MAX_RECOVERY_ATTEMPTS);
++        dda->recovery_attempts++;
++        if (recover_duplication(avctx) < 0)
++            return AVERROR_EXTERNAL;
++        return AVERROR(EAGAIN);
+     } else if (FAILED(hr)) {
+         av_log(avctx, AV_LOG_ERROR, "AcquireNextFrame failed: %lx\n", hr);
+         return AVERROR_EXTERNAL;
+     }
++    dda->recovery_attempts = 0;
+ 
+     if (dda->draw_mouse) {
+         ret = update_mouse_pointer(avctx, &frame_info);
+@@ -1192,7 +1314,20 @@ static int ddagrab_request_frame(AVFilterLink *outlink)
+     release_resource(&cur_texture);
+ 
+     hr = IDXGIOutputDuplication_ReleaseFrame(dda->dxgi_outdupl);
+-    if (FAILED(hr)) {
++    if ((hr == DXGI_ERROR_ACCESS_LOST || hr == E_ACCESSDENIED || hr == DXGI_ERROR_INVALID_CALL) &&
++        dda->recovery_attempts < DDAGRAB_MAX_RECOVERY_ATTEMPTS) {
++        av_log(avctx, AV_LOG_WARNING,
++               "ReleaseFrame lost desktop duplication (%lx), attempting recovery (%d/%d)\n",
++               hr, dda->recovery_attempts + 1, DDAGRAB_MAX_RECOVERY_ATTEMPTS);
++        dda->recovery_attempts++;
++        if (recover_duplication(avctx) < 0) {
++            ret = AVERROR_EXTERNAL;
++            goto fail;
++        }
++        /* The frame was already copied into `frame` above; only the
++         * duplication handle itself was stale, so this frame is still
++         * good to deliver. */
++    } else if (FAILED(hr)) {
+         av_log(avctx, AV_LOG_ERROR, "DDA ReleaseFrame failed!\n");
+         ret = AVERROR_EXTERNAL;
+         goto fail;

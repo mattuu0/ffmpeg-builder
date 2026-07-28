@@ -83,6 +83,20 @@ RUN set -eux; \
 
 COPY ffmpeg-src/ /build/
 
+# Apply source patches to ffmpeg-src before configuring. Patches are kept
+# outside the ffmpeg-src submodule and re-applied fresh on every build so
+# they survive the daily automated submodule version bumps (see
+# .github/workflows/check-ffmpeg-release.yml); if upstream changes enough to
+# break a patch, fail the build loudly here rather than silently shipping
+# unpatched behavior.
+COPY patches/ddagrab-uac-recovery.patch /tmp/ddagrab-uac-recovery.patch
+RUN cd /build && \
+    (git apply --check /tmp/ddagrab-uac-recovery.patch 2>/tmp/patch-check.log && \
+     git apply /tmp/ddagrab-uac-recovery.patch && \
+     echo "ddagrab-uac-recovery.patch applied successfully") || \
+    (echo "FATAL: ddagrab-uac-recovery.patch failed to apply -- upstream ffmpeg-src/libavfilter/vsrc_ddagrab.c likely changed. Manual patch rebase required." >&2; \
+     cat /tmp/patch-check.log >&2; exit 1)
+
 # ---------------------------------------------------------------------------
 # configure flags — edit below to add/remove features for the Windows build.
 #
