@@ -63,3 +63,4 @@ jobs:
           git tag "v${{ steps.latest.outputs.tag }}"
           git push origin HEAD:${{ github.ref_name }}
           git push origin "v${{ steps.latest.outputs.tag }}"
+
