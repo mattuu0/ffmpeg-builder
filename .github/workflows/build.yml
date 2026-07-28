@@ -53,15 +53,32 @@ jobs:
           path: dist/macos/arm64
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
     needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Determine release tag from ffmpeg-src version
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            # workflow_dispatch (or any non-tag trigger): derive the tag from
+            # whatever version ffmpeg-src is currently checked out at, so the
+            # release always reflects the FFmpeg version actually built.
+            ffmpeg_ref=$(cd ffmpeg-src && (git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD))
+            echo "tag=v${ffmpeg_ref}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
       - name: Package release assets
         run: |
           mkdir -p release
@@ -69,9 +86,12 @@ jobs:
             name="$(basename "$dir")"
             (cd "$dir" && zip -r "../../release/${name}.zip" .)
           done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           files: release/*.zip
           generate_release_notes: true
 
