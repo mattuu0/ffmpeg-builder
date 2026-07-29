@@ -1,0 +1,340 @@
+diff --git a/configure b/configure
+index 374bd5c151..68b5dd9ab4 100755
+--- a/configure
++++ b/configure
+@@ -4061,6 +4061,8 @@ v4l2_indev_suggest="libv4l2"
+ v4l2_outdev_deps_any="linux_videodev2_h sys_videoio_h"
+ v4l2_outdev_suggest="libv4l2"
+ vfwcap_indev_deps="vfw32 vfwcap_defines"
++wasapi_indev_deps="IMMDeviceEnumerator"
++wasapi_indev_extralibs="-lole32"
+ xcbgrab_indev_deps="libxcb"
+ xcbgrab_indev_suggest="libxcb_shm libxcb_shape libxcb_xfixes"
+ xv_outdev_deps="xlib_xv xlib_x11 xlib_xext"
+@@ -7165,6 +7167,7 @@ check_type "windows.h dxgi1_2.h" "IDXGIOutput1"
+ check_type "windows.h dxgi1_5.h" "IDXGIOutput5"
+ check_type "windows.h d3d11.h" "ID3D11VideoDecoder"
+ check_type "windows.h d3d11.h" "ID3D11VideoContext"
++check_type "windows.h mmdeviceapi.h" "IMMDeviceEnumerator"
+ check_type "windows.h d3d12.h" "ID3D12Device"
+ check_type "windows.h d3d12video.h" "ID3D12VideoDecoder"
+ check_type "windows.h d3d12video.h" "ID3D12VideoEncoder"
+diff --git a/libavdevice/Makefile b/libavdevice/Makefile
+index 256c8e7bea..39001c8215 100644
+--- a/libavdevice/Makefile
++++ b/libavdevice/Makefile
+@@ -45,6 +45,7 @@ OBJS-$(CONFIG_SNDIO_OUTDEV)              += sndio_enc.o sndio.o
+ OBJS-$(CONFIG_V4L2_INDEV)                += v4l2.o v4l2-common.o timefilter.o
+ OBJS-$(CONFIG_V4L2_OUTDEV)               += v4l2enc.o v4l2-common.o
+ OBJS-$(CONFIG_VFWCAP_INDEV)              += vfwcap.o
++OBJS-$(CONFIG_WASAPI_INDEV)              += wasapi.o
+ OBJS-$(CONFIG_XCBGRAB_INDEV)             += xcbgrab.o
+ OBJS-$(CONFIG_XV_OUTDEV)                 += xv.o
+ 
+diff --git a/libavdevice/alldevices.c b/libavdevice/alldevices.c
+index 573595f416..4d9778d143 100644
+--- a/libavdevice/alldevices.c
++++ b/libavdevice/alldevices.c
+@@ -53,6 +53,7 @@ extern const FFOutputFormat ff_sndio_muxer;
+ extern const FFInputFormat  ff_v4l2_demuxer;
+ extern const FFOutputFormat ff_v4l2_muxer;
+ extern const FFInputFormat  ff_vfwcap_demuxer;
++extern const FFInputFormat  ff_wasapi_demuxer;
+ extern const FFInputFormat  ff_xcbgrab_demuxer;
+ extern const FFOutputFormat ff_xv_muxer;
+ 
+diff --git a/libavdevice/wasapi.c b/libavdevice/wasapi.c
+new file mode 100644
+index 0000000000..c20addca3c
+--- /dev/null
++++ b/libavdevice/wasapi.c
+@@ -0,0 +1,289 @@
++/*
++ * WASAPI loopback input (Windows system/application audio capture)
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Captures the default (or a named) audio render endpoint's output via
++ * WASAPI loopback -- i.e. "what you hear" (system/application audio), as
++ * opposed to a microphone. FFmpeg otherwise only exposes Windows audio
++ * capture via dshow, which has no built-in notion of loopback and needs an
++ * extra virtual-cable driver installed to achieve the same result.
++ */
++
++#define COBJMACROS
++#define INITGUID
++
++#include <audioclient.h>
++#include <mmdeviceapi.h>
++#include <windows.h>
++
++#include "libavutil/opt.h"
++#include "libavutil/time.h"
++#include "libavformat/avformat.h"
++#include "libavformat/demux.h"
++#include "libavformat/internal.h"
++
++typedef struct WasapiData {
++    AVClass *class;
++
++    IMMDeviceEnumerator *enumerator;
++    IMMDevice *device;
++    IAudioClient *audio_client;
++    IAudioCaptureClient *capture_client;
++
++    WAVEFORMATEX *mix_format;
++    int frame_size;
++
++    int64_t first_pts;
++} WasapiData;
++
++static void wasapi_read_close_com(WasapiData *wd)
++{
++    if (wd->capture_client) {
++        IAudioCaptureClient_Release(wd->capture_client);
++        wd->capture_client = NULL;
++    }
++    if (wd->audio_client) {
++        IAudioClient_Stop(wd->audio_client);
++        IAudioClient_Release(wd->audio_client);
++        wd->audio_client = NULL;
++    }
++    if (wd->mix_format) {
++        CoTaskMemFree(wd->mix_format);
++        wd->mix_format = NULL;
++    }
++    if (wd->device) {
++        IMMDevice_Release(wd->device);
++        wd->device = NULL;
++    }
++    if (wd->enumerator) {
++        IMMDeviceEnumerator_Release(wd->enumerator);
++        wd->enumerator = NULL;
++    }
++}
++
++static av_cold int wasapi_read_close(AVFormatContext *s)
++{
++    WasapiData *wd = s->priv_data;
++
++    wasapi_read_close_com(wd);
++    CoUninitialize();
++
++    return 0;
++}
++
++static av_cold int wasapi_read_header(AVFormatContext *s)
++{
++    WasapiData *wd = s->priv_data;
++    AVStream *st;
++    HRESULT hr;
++    const REFERENCE_TIME buffer_duration = 20 * 10000; /* 20ms in 100ns units */
++
++    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    /* RPC_E_CHANGED_MODE means some other component on this thread already
++     * called CoInitializeEx with a different concurrency model; WASAPI
++     * still works fine on such a thread, so this is not fatal. Anything
++     * else failing here means COM itself is unusable. */
++    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
++        av_log(s, AV_LOG_ERROR, "CoInitializeEx failed: 0x%lx\n", (unsigned long)hr);
++        return AVERROR_EXTERNAL;
++    }
++
++    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
++                           &IID_IMMDeviceEnumerator, (void **)&wd->enumerator);
++    if (FAILED(hr)) {
++        av_log(s, AV_LOG_ERROR, "CoCreateInstance(MMDeviceEnumerator) failed: 0x%lx\n", (unsigned long)hr);
++        goto fail;
++    }
++
++    /* The URL (-i <url>) selects a specific render endpoint by its ID (as
++     * reported by e.g. `ffmpeg -f wasapi -list_devices true -i dummy`); an
++     * empty or "default" URL falls back to the system default render
++     * device, mirroring how most other FFmpeg audio indevs treat "default". */
++    if (s->url[0] && strcmp(s->url, "default")) {
++        wchar_t wid[256];
++        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s->url, -1, wid, FF_ARRAY_ELEMS(wid))) {
++            av_log(s, AV_LOG_ERROR, "device id \"%s\" is not valid UTF-8 or too long\n", s->url);
++            goto fail;
++        }
++        hr = IMMDeviceEnumerator_GetDevice(wd->enumerator, wid, &wd->device);
++    } else {
++        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(wd->enumerator, eRender, eConsole, &wd->device);
++    }
++    if (FAILED(hr)) {
++        av_log(s, AV_LOG_ERROR, "Failed to open render endpoint: 0x%lx\n", (unsigned long)hr);
++        goto fail;
++    }
++
++    hr = IMMDevice_Activate(wd->device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&wd->audio_client);
++    if (FAILED(hr)) {
++        av_log(s, AV_LOG_ERROR, "IMMDevice::Activate failed: 0x%lx\n", (unsigned long)hr);
++        goto fail;
++    }
++
++    hr = IAudioClient_GetMixFormat(wd->audio_client, &wd->mix_format);
++    if (FAILED(hr)) {
++        av_log(s, AV_LOG_ERROR, "GetMixFormat failed: 0x%lx\n", (unsigned long)hr);
++        goto fail;
++    }
++
++    /* AUDCLNT_STREAMFLAGS_LOOPBACK is what turns this render-endpoint
++     * IAudioClient into a capture of that endpoint's output, instead of
++     * requiring an eCapture endpoint. */
++    hr = IAudioClient_Initialize(wd->audio_client, AUDCLNT_SHAREMODE_SHARED,
++                                  AUDCLNT_STREAMFLAGS_LOOPBACK, buffer_duration,
++                                  0, wd->mix_format, NULL);
++    if (FAILED(hr)) {
++        av_log(s, AV_LOG_ERROR, "IAudioClient::Initialize failed: 0x%lx\n", (unsigned long)hr);
++        goto fail;
++    }
++
++    hr = IAudioClient_GetService(wd->audio_client, &IID_IAudioCaptureClient, (void **)&wd->capture_client);
++    if (FAILED(hr)) {
++        av_log(s, AV_LOG_ERROR, "GetService(IAudioCaptureClient) failed: 0x%lx\n", (unsigned long)hr);
++        goto fail;
++    }
++
++    st = avformat_new_stream(s, NULL);
++    if (!st) {
++        av_log(s, AV_LOG_ERROR, "Cannot add stream\n");
++        goto fail;
++    }
++
++    /* The render endpoint's mix format is authoritative -- WASAPI shared
++     * mode does not allow requesting an arbitrary rate/format the way
++     * exclusive mode does, so sample_rate_opt (if the caller set one) is
++     * only used for logging/diagnostics, never to override this. */
++    if (wd->mix_format->wFormatTag != WAVE_FORMAT_IEEE_FLOAT &&
++        !(wd->mix_format->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
++          wd->mix_format->wBitsPerSample == 32)) {
++        av_log(s, AV_LOG_ERROR, "Unsupported mix format tag 0x%x / %u bits (only 32-bit float is supported)\n",
++               wd->mix_format->wFormatTag, wd->mix_format->wBitsPerSample);
++        goto fail;
++    }
++
++    st->codecpar->codec_type            = AVMEDIA_TYPE_AUDIO;
++    st->codecpar->codec_id              = AV_CODEC_ID_PCM_F32LE;
++    st->codecpar->sample_rate           = wd->mix_format->nSamplesPerSec;
++    st->codecpar->ch_layout.nb_channels = wd->mix_format->nChannels;
++    avpriv_set_pts_info(st, 64, 1, 1000000);
++
++    wd->frame_size = wd->mix_format->nBlockAlign;
++    wd->first_pts  = AV_NOPTS_VALUE;
++
++    hr = IAudioClient_Start(wd->audio_client);
++    if (FAILED(hr)) {
++        av_log(s, AV_LOG_ERROR, "IAudioClient::Start failed: 0x%lx\n", (unsigned long)hr);
++        goto fail;
++    }
++
++    return 0;
++
++fail:
++    wasapi_read_close_com(wd);
++    return AVERROR_EXTERNAL;
++}
++
++static int wasapi_read_packet(AVFormatContext *s, AVPacket *pkt)
++{
++    WasapiData *wd = s->priv_data;
++    HRESULT hr;
++    UINT32 packet_length = 0;
++    int64_t now;
++
++    /* WASAPI has no blocking read: poll GetNextPacketSize until a full
++     * packet is ready, sleeping briefly between checks so this doesn't
++     * busy-spin. 10ms matches the granularity most callers already expect
++     * from a live audio source and keeps latency low. */
++    for (;;) {
++        hr = IAudioCaptureClient_GetNextPacketSize(wd->capture_client, &packet_length);
++        if (FAILED(hr)) {
++            av_log(s, AV_LOG_ERROR, "GetNextPacketSize failed: 0x%lx\n", (unsigned long)hr);
++            return AVERROR_EXTERNAL;
++        }
++        if (packet_length != 0)
++            break;
++        av_usleep(10 * 1000);
++    }
++
++    {
++        BYTE *data = NULL;
++        UINT32 num_frames = 0;
++        DWORD flags = 0;
++        int size;
++
++        hr = IAudioCaptureClient_GetBuffer(wd->capture_client, &data, &num_frames, &flags, NULL, NULL);
++        if (FAILED(hr)) {
++            av_log(s, AV_LOG_ERROR, "GetBuffer failed: 0x%lx\n", (unsigned long)hr);
++            return AVERROR_EXTERNAL;
++        }
++
++        size = num_frames * wd->frame_size;
++        if (av_new_packet(pkt, size) < 0) {
++            IAudioCaptureClient_ReleaseBuffer(wd->capture_client, num_frames);
++            return AVERROR(ENOMEM);
++        }
++
++        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
++            /* No data currently playing on this endpoint: WASAPI allows the
++             * data pointer to be invalid in this case. Emit explicit
++             * silence so the stream stays contiguous/in sync with
++             * wall-clock time instead of gapping. */
++            memset(pkt->data, 0, size);
++        } else {
++            memcpy(pkt->data, data, size);
++        }
++
++        hr = IAudioCaptureClient_ReleaseBuffer(wd->capture_client, num_frames);
++        if (FAILED(hr)) {
++            av_log(s, AV_LOG_ERROR, "ReleaseBuffer failed: 0x%lx\n", (unsigned long)hr);
++            av_packet_unref(pkt);
++            return AVERROR_EXTERNAL;
++        }
++    }
++
++    now = av_gettime();
++    if (wd->first_pts == AV_NOPTS_VALUE)
++        wd->first_pts = now;
++    pkt->pts = now - wd->first_pts;
++
++    return 0;
++}
++
++/* WASAPI shared-mode loopback always uses the render endpoint's own mix
++ * format (sample rate, channel count) -- shared mode, unlike exclusive
++ * mode, does not support requesting an arbitrary format, so there is
++ * nothing meaningful to expose as an AVOption here. */
++static const AVClass wasapi_demuxer_class = {
++    .class_name = "WASAPI indev",
++    .item_name  = av_default_item_name,
++    .version    = LIBAVUTIL_VERSION_INT,
++    .category   = AV_CLASS_CATEGORY_DEVICE_AUDIO_INPUT,
++};
++
++const FFInputFormat ff_wasapi_demuxer = {
++    .p.name         = "wasapi",
++    .p.long_name    = NULL_IF_CONFIG_SMALL("WASAPI loopback audio input"),
++    .p.flags        = AVFMT_NOFILE,
++    .p.priv_class   = &wasapi_demuxer_class,
++    .priv_data_size = sizeof(WasapiData),
++    .read_header    = wasapi_read_header,
++    .read_packet    = wasapi_read_packet,
++    .read_close     = wasapi_read_close,
++};

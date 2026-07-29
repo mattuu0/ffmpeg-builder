@@ -119,19 +119,6 @@ RUN set -eux; \
     make -j"$(nproc)" && make install; \
     cd /build && rm -rf /tmp/opus
 
-# WASAPI loopback capture helper: streams the default render device's audio
-# (system/app audio) as raw PCM to stdout, so it can be piped into ffmpeg
-# alongside ddagrab's video for combined video+audio recording. FFmpeg has no
-# WASAPI indev itself (only dshow), so this small standalone helper fills the
-# gap. Static libgcc/libstdc++/winpthread link matches the FFmpeg binaries
-# below so it runs standalone without extra runtime DLLs.
-COPY tools/wasapi-loopback/wasapi_loopback.cpp /tmp/wasapi_loopback.cpp
-RUN set -eux; \
-    if [ "$ARCH" = "amd64" ]; then CXX=x86_64-w64-mingw32-g++; else CXX=aarch64-w64-mingw32-g++; fi; \
-    "$CXX" -O2 -static -static-libgcc -static-libstdc++ \
-      -o /tmp/wasapi_loopback.exe /tmp/wasapi_loopback.cpp \
-      -lole32 -lavrt
-
 COPY ffmpeg-src/ /build/
 
 # Apply source patches to ffmpeg-src before configuring. Patches are kept
@@ -172,15 +159,29 @@ RUN cd /build && \
     (echo "FATAL: ddagrab-output-name.patch failed to apply -- upstream ffmpeg-src/libavfilter/vsrc_ddagrab.c likely changed. Manual patch rebase required." >&2; \
      cat /tmp/patch-check3.log >&2; exit 1)
 
+# Adds a native "wasapi" avdevice indev (libavdevice/wasapi.c, new file --
+# doesn't touch any existing FFmpeg code beyond a few one-line registration
+# entries) that captures the default render endpoint's output via WASAPI
+# loopback, replacing the standalone wasapi_loopback.exe + stdin-pipe
+# approach with a proper `-f wasapi -i default` input.
+COPY patches/wasapi-indev.patch /tmp/wasapi-indev.patch
+RUN cd /build && \
+    (git apply --check /tmp/wasapi-indev.patch 2>/tmp/patch-check4.log && \
+     git apply /tmp/wasapi-indev.patch && \
+     echo "wasapi-indev.patch applied successfully") || \
+    (echo "FATAL: wasapi-indev.patch failed to apply -- upstream ffmpeg-src configure/libavdevice files likely changed. Manual patch rebase required." >&2; \
+     cat /tmp/patch-check4.log >&2; exit 1)
+
 # ---------------------------------------------------------------------------
 # configure flags — edit below to add/remove features for the Windows build.
 #
 # Minimal build: H.264/H.265 hardware encode + openh264 (H.264 software)
-# fallback, plus Opus audio encode/decode (WASAPI loopback capture is done by
-# the standalone wasapi_loopback.exe helper piped into ffmpeg, since FFmpeg
-# has no WASAPI indev of its own -- only dshow). QSV (libvpl) cross-build for
-# mingw is not wired up here — it needs a Windows-targeted libvpl build,
-# which is nontrivial to cross-compile. VAAPI is Linux-only, excluded.
+# fallback, plus Opus audio encode/decode and a native WASAPI loopback
+# capture indev (patches/wasapi-indev.patch, see comment above) so system/
+# application audio can be recorded with a plain `-f wasapi -i default`
+# input. QSV (libvpl) cross-build for mingw is not wired up here — it needs
+# a Windows-targeted libvpl build, which is nontrivial to cross-compile.
+# VAAPI is Linux-only, excluded.
 #
 # No -flto here: linking libswscale with LTO enabled against this mingw
 # toolchain fails with "undefined reference" to symbols defined in its x86
@@ -222,6 +223,8 @@ RUN set -eux; \
       --enable-d3d11va \
       --enable-filter=ddagrab \
       --enable-filter=scale_d3d11 \
+      --enable-avdevice \
+      --enable-indev=wasapi \
       --enable-protocol=file \
       --enable-protocol=pipe \
       --enable-protocol=tcp \
@@ -287,8 +290,6 @@ RUN set -eux; \
       echo "FATAL: libwinpthread-*.dll not found under /usr/${MINGW_PREFIX} or /opt/llvm-mingw" >&2; exit 1; \
     fi; \
     cp "$winpthread_dll" /dist/bin/
-
-RUN cp /tmp/wasapi_loopback.exe /dist/bin/wasapi_loopback.exe
 
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then STRIP=x86_64-w64-mingw32-strip; else STRIP=aarch64-w64-mingw32-strip; fi; \

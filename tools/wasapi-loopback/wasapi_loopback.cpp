@@ -1,6 +1,13 @@
 // Minimal WASAPI loopback capture: streams the default audio-render device's
 // output (system/app audio) as raw interleaved float32 PCM to stdout.
 //
+// Superseded by the native "wasapi" avdevice indev (patches/wasapi-indev.patch,
+// libavdevice/wasapi.c) -- ffmpeg -f wasapi -i default now does the same
+// thing directly, without a separate process/pipe. This standalone tool is
+// no longer built or shipped by docker/windows/Dockerfile; the source is
+// kept only for reference / for anyone who still wants the process+pipe
+// approach.
+//
 // Usage: wasapi_loopback.exe > out.pcm
 //   or piped straight into ffmpeg:
 //   wasapi_loopback.exe | ffmpeg -f f32le -ar <rate> -ac <channels> -i pipe:0 ...

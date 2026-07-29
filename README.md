@@ -9,9 +9,10 @@
 想定用途: 画面キャプチャ（Windows: ddagrab, Linux: xcbgrab/kmsgrab,
 macOS: avfoundation）や raw 映像入力を、ハードウェアエンコーダで
 H.264/H.265 にリアルタイムエンコードし、必要に応じて Opus 音声（Windows は
-`wasapi_loopback.exe` によるシステム音声ループバック録音）を同じ MP4 に
-まとめる用途。既存の圧縮済み動画を読み込んでデコード・トランスコードする
-用途には使えない（H.264/HEVC 以外のデコーダを含まないため）。
+ネイティブ `wasapi` indev によるシステム音声ループバック録音、
+`-f wasapi -i default`）を同じ MP4 にまとめる用途。既存の圧縮済み動画を
+読み込んでデコード・トランスコードする用途には使えない（H.264/HEVC 以外の
+デコーダを含まないため）。
 
 ## リポジトリ構成
 
@@ -226,17 +227,25 @@ MP4/MOV/Matroska/MPEG-TS/FLV への Opus 格納に対応する。
   無効化し、`libm`（`sqrtf`/`cos` 等）を `--extra-libs=-lm` で明示リンク
   している。
 
-### WASAPI ループバック録音ヘルパー (`tools/wasapi-loopback/`)
+### ネイティブ WASAPI ループバック録音 indev (`libavdevice/wasapi.c`)
 
 FFmpeg には Windows 向けの音声入力デバイスが `dshow`（DirectShow）しか無く、
 システム音声（スピーカー出力）をそのままループバック録音する標準的な手段が
-無い。このリポジトリでは `wasapi_loopback.exe` という独立した小さな C++
-ヘルパーを追加し、WASAPI (`IAudioClient` の `AUDCLNT_STREAMFLAGS_LOOPBACK`)
-経由でデフォルト再生デバイスの音声を raw float32 PCM として標準出力に
-垂れ流す。Windows ビルドの `bin/` に同梱され、`ffmpeg.exe` の標準入力に
-パイプで直結して `-f f32le -i -` として読み込み、Opus エンコード後に
-映像（ddagrab）と MP4 に多重化する使い方を想定する
+無い。`patches/wasapi-indev.patch` により `libavdevice/wasapi.c` を新規
+追加し、`wasapi` という avdevice indev として登録した。`IAudioClient` の
+`AUDCLNT_STREAMFLAGS_LOOPBACK` 経由でデフォルト（または指定した）再生
+デバイスの出力を直接キャプチャし、`ffmpeg` の通常の入力
+（`-f wasapi -i default`）として扱える。既存の FFmpeg コードは
+`libavdevice/alldevices.c`・`libavdevice/Makefile`・`configure` への
+数行の登録追加のみで、ロジック自体は新規ファイルに閉じているため、
+アップストリームの変更で壊れる可能性は低い
 （`scripts/test-ddagrab-record.py --with-audio` 参照）。
+
+以前は `tools/wasapi-loopback/wasapi_loopback.cpp` という別プロセス＋
+標準入力パイプ方式のスタンドアロンヘルパーで同じことを実現していたが、
+ネイティブ indev 化によりプロセス起動・パイプ同期のオーバーヘッドが無くなり
+`ffmpeg` 単体で完結するようになったため、Windows ビルドではこちらは
+コンパイル・同梱しなくなった（ソースは参考として残置）。
 
 ### ddagrab の UAC (secure desktop) 遷移からの自動復旧
 
