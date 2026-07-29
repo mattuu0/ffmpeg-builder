@@ -84,6 +84,46 @@ RUN set -eux; \
     ninja -C build install; \
     cd /build && rm -rf /tmp/openh264 /tmp/mingw-cross.ini
 
+# libopus (BSD-licensed), cross-built for mingw for Opus audio encode/decode.
+# Uses the release tarball (which ships a pre-generated ./configure), not a
+# git clone of the tag -- the opus git tree requires autoreconf (autoconf/
+# automake/libtool, and a network fetch of the download-the-latest-model
+# tool) to produce configure, none of which are installed in this image.
+RUN set -eux; \
+    if [ "$ARCH" = "amd64" ]; then \
+      MINGW_PREFIX=x86_64-w64-mingw32; \
+    else \
+      MINGW_PREFIX=aarch64-w64-mingw32; \
+    fi; \
+    curl -L -o /tmp/opus.tar.gz https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz; \
+    mkdir /tmp/opus; \
+    tar -xzf /tmp/opus.tar.gz -C /tmp/opus --strip-components=1; \
+    rm /tmp/opus.tar.gz; \
+    cd /tmp/opus; \
+    CFLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" ./configure \
+      --host="${MINGW_PREFIX}" \
+      --prefix="/usr/${MINGW_PREFIX}" \
+      --disable-shared \
+      --enable-static \
+      --disable-doc \
+      --disable-extra-programs \
+      --with-pic; \
+    make -j"$(nproc)" && make install; \
+    cd /build && rm -rf /tmp/opus
+
+# WASAPI loopback capture helper: streams the default render device's audio
+# (system/app audio) as raw PCM to stdout, so it can be piped into ffmpeg
+# alongside ddagrab's video for combined video+audio recording. FFmpeg has no
+# WASAPI indev itself (only dshow), so this small standalone helper fills the
+# gap. Static libgcc/libstdc++/winpthread link matches the FFmpeg binaries
+# below so it runs standalone without extra runtime DLLs.
+COPY tools/wasapi-loopback/wasapi_loopback.cpp /tmp/wasapi_loopback.cpp
+RUN set -eux; \
+    if [ "$ARCH" = "amd64" ]; then CXX=x86_64-w64-mingw32-g++; else CXX=aarch64-w64-mingw32-g++; fi; \
+    "$CXX" -O2 -static -static-libgcc -static-libstdc++ \
+      -o /tmp/wasapi_loopback.exe /tmp/wasapi_loopback.cpp \
+      -lole32 -lavrt
+
 COPY ffmpeg-src/ /build/
 
 # Apply source patches to ffmpeg-src before configuring. Patches are kept
@@ -100,13 +140,32 @@ RUN cd /build && \
     (echo "FATAL: ddagrab-uac-recovery.patch failed to apply -- upstream ffmpeg-src/libavfilter/vsrc_ddagrab.c likely changed. Manual patch rebase required." >&2; \
      cat /tmp/patch-check.log >&2; exit 1)
 
+# Fixes scale_d3d11 (GPU BGRA->NV12 conversion used ahead of hardware H.264/
+# HEVC encoders) silently defaulting to the wrong color range, which crushes
+# blacks / fades colors once the encoded video is decoded and played back
+# downstream. See patch header for full explanation.
+COPY patches/scale_d3d11-colorspace.patch /tmp/scale_d3d11-colorspace.patch
+RUN cd /build && \
+    (git apply --check /tmp/scale_d3d11-colorspace.patch 2>/tmp/patch-check2.log && \
+     git apply /tmp/scale_d3d11-colorspace.patch && \
+     echo "scale_d3d11-colorspace.patch applied successfully") || \
+    (echo "FATAL: scale_d3d11-colorspace.patch failed to apply -- upstream ffmpeg-src/libavfilter/vf_scale_d3d11.c likely changed. Manual patch rebase required." >&2; \
+     cat /tmp/patch-check2.log >&2; exit 1)
+
 # ---------------------------------------------------------------------------
 # configure flags — edit below to add/remove features for the Windows build.
 #
 # Minimal build: H.264/H.265 hardware encode + openh264 (H.264 software)
-# fallback, no audio, no software decoders. QSV (libvpl) cross-build for
+# fallback, plus Opus audio encode/decode (WASAPI loopback capture is done by
+# the standalone wasapi_loopback.exe helper piped into ffmpeg, since FFmpeg
+# has no WASAPI indev of its own -- only dshow). QSV (libvpl) cross-build for
 # mingw is not wired up here — it needs a Windows-targeted libvpl build,
 # which is nontrivial to cross-compile. VAAPI is Linux-only, excluded.
+#
+# No -flto here: linking libswscale with LTO enabled against this mingw
+# toolchain fails with "undefined reference" to symbols defined in its x86
+# NASM assembly objects (e.g. bF8/mask24r/mul16_mid) -- the LTO plugin can't
+# see across the asm/C boundary the way it can on the Linux/macOS builds.
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then \
@@ -142,6 +201,7 @@ RUN set -eux; \
       --disable-debug \
       --enable-d3d11va \
       --enable-filter=ddagrab \
+      --enable-filter=scale_d3d11 \
       --enable-protocol=file \
       --enable-protocol=pipe \
       --enable-protocol=tcp \
@@ -157,13 +217,21 @@ RUN set -eux; \
       --enable-muxer=flv \
       --enable-parser=h264 \
       --enable-parser=hevc \
+      --enable-parser=opus \
       --enable-bsf=h264_mp4toannexb \
       --enable-bsf=hevc_mp4toannexb \
-      --enable-filter=scale \
       --enable-filter=format \
+      --enable-filter=scale \
       --enable-filter=null \
+      --enable-filter=aformat \
+      --enable-filter=anull \
+      --enable-swscale \
+      --enable-swresample \
       --enable-libopenh264 \
+      --enable-libopus \
       --enable-encoder=libopenh264 \
+      --enable-encoder=libopus \
+      --enable-decoder=libopus \
       $( [ "$ARCH" = "amd64" ] && echo \
            --enable-ffnvcodec \
            --enable-amf \
@@ -173,7 +241,7 @@ RUN set -eux; \
            --enable-encoder=hevc_amf ) \
       --extra-cflags="-Os -ffunction-sections -fdata-sections" \
       --extra-ldflags="-Wl,--gc-sections -static-libgcc -static-libstdc++" \
-      --extra-libs="-ldxgi -Wl,-Bstatic,-lwinpthread,-Bdynamic"
+      --extra-libs="-lm -ldxgi -Wl,-Bstatic,-lwinpthread,-Bdynamic"
 
 RUN make -j"$(nproc)" && make install
 
@@ -199,6 +267,8 @@ RUN set -eux; \
       echo "FATAL: libwinpthread-*.dll not found under /usr/${MINGW_PREFIX} or /opt/llvm-mingw" >&2; exit 1; \
     fi; \
     cp "$winpthread_dll" /dist/bin/
+
+RUN cp /tmp/wasapi_loopback.exe /dist/bin/wasapi_loopback.exe
 
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then STRIP=x86_64-w64-mingw32-strip; else STRIP=aarch64-w64-mingw32-strip; fi; \

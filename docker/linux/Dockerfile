@@ -74,6 +74,22 @@ RUN git clone --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git /tmp
     && cp -r /tmp/AMF/amf/public/include/* /usr/include/AMF/ \
     && rm -rf /tmp/AMF
 
+# libopus (BSD-licensed) for Opus audio encode/decode. Uses the release
+# tarball (ships a pre-generated ./configure) rather than a git clone of the
+# tag, which would need autoreconf (autoconf/automake/libtool + a network
+# fetch) to produce configure.
+RUN set -eux; \
+    curl -L -o /tmp/opus.tar.gz https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz; \
+    mkdir /tmp/opus; \
+    tar -xzf /tmp/opus.tar.gz -C /tmp/opus --strip-components=1; \
+    rm /tmp/opus.tar.gz; \
+    cd /tmp/opus; \
+    mkdir build-amd64; \
+    (cd build-amd64 && ../configure --prefix=/usr --disable-shared --enable-static --disable-doc --disable-extra-programs --with-pic && make -j"$(nproc)" && make install); \
+    mkdir build-arm64; \
+    (cd build-arm64 && CFLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" ../configure --host=aarch64-linux-gnu --prefix=/usr/aarch64-linux-gnu --disable-shared --enable-static --disable-doc --disable-extra-programs --with-pic && make -j"$(nproc)" && make install); \
+    cd /build && rm -rf /tmp/opus
+
 COPY ffmpeg-src/ /build/
 
 # ---------------------------------------------------------------------------
@@ -82,6 +98,13 @@ COPY ffmpeg-src/ /build/
 # Minimal build: H.264/H.265 hardware encode only, no audio, no software
 # decoders. Input is expected to be raw video (e.g. from x11grab/kmsgrab
 # screen capture) piped straight into a hardware encoder.
+#
+# No -flto: linking libswscale as a shared object with LTO enabled fails
+# ("relocation ... can not be used when making a shared object; recompile
+# with -fPIC") because LTO recompiles its x86 NASM-derived C fallback/data
+# objects without -fPIC awareness. Same underlying issue as the Windows
+# build, just surfacing as a PIC/relocation error here instead of an
+# undefined-reference one.
 # ---------------------------------------------------------------------------
 RUN set -eux; \
     COMMON_FLAGS=" \
@@ -114,13 +137,22 @@ RUN set -eux; \
       --enable-muxer=flv \
       --enable-parser=h264 \
       --enable-parser=hevc \
+      --enable-parser=opus \
       --enable-bsf=h264_mp4toannexb \
       --enable-bsf=hevc_mp4toannexb \
-      --enable-filter=scale \
       --enable-filter=format \
+      --enable-filter=scale \
       --enable-filter=null \
+      --enable-filter=aformat \
+      --enable-filter=anull \
+      --enable-swscale \
+      --enable-swresample \
+      --enable-libopus \
+      --enable-encoder=libopus \
+      --enable-decoder=libopus \
       --extra-cflags=\"-Os -ffunction-sections -fdata-sections\" \
       --extra-ldflags=\"-Wl,--gc-sections\" \
+      --extra-libs=\"-lm\" \
     "; \
     if [ "$ARCH" = "amd64" ]; then \
       eval ./configure $COMMON_FLAGS \

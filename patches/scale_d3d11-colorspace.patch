@@ -1,0 +1,82 @@
+diff --git a/libavfilter/vf_scale_d3d11.c b/libavfilter/vf_scale_d3d11.c
+index 549aba547d..bad346109f 100644
+--- a/libavfilter/vf_scale_d3d11.c
++++ b/libavfilter/vf_scale_d3d11.c
+@@ -38,6 +38,7 @@ typedef struct ScaleD3D11Context {
+     char *w_expr;
+     char *h_expr;
+     enum AVPixelFormat format;
++    int in_range;
+ 
+     ///< D3D11 objects
+     ID3D11Device *device;
+@@ -145,6 +146,43 @@ static int scale_d3d11_configure_processor(ScaleD3D11Context *s, AVFilterContext
+     return 0;
+ }
+ 
++/*
++ * Desktop Duplication (ddagrab) and most other D3D11 RGB sources hand out
++ * full-range (0-255) BGRA surfaces, but this filter's only consumers are
++ * hardware H.264/HEVC encoders that expect studio/limited-range (16-235) YUV.
++ * VideoProcessorBlt silently uses the D3D11 video processor's own default
++ * color space assumptions unless told otherwise, which reinterprets our
++ * full-range RGB input as if it were limited-range: the result is crushed
++ * blacks / raised blacks and a visibly "faded" look once decoded and played
++ * back downstream. Setting explicit input (RGB, full or studio range per the
++ * source frame, BT.709) and output (YUV, studio range, BT.709) color spaces
++ * on the stream makes the video processor perform the correct range
++ * compression as part of the same GPU Blt, avoiding an extra
++ * hwdownload+swscale round trip just to fix range handling.
++ */
++static void scale_d3d11_set_colorspace(ScaleD3D11Context *s, ID3D11VideoContext *videoContext)
++{
++    D3D11_VIDEO_PROCESSOR_COLOR_SPACE input_cs = {
++        .Usage         = 0, /* playback */
++        .RGB_Range     = s->in_range == AVCOL_RANGE_JPEG ? 0 : 1, /* 0 = 0-255 (full), 1 = 16-235 (studio) */
++        .YCbCr_Matrix  = 1, /* BT.709 */
++        .YCbCr_xvYCC   = 0,
++        .Nominal_Range = s->in_range == AVCOL_RANGE_JPEG
++                             ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255
++                             : D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235,
++    };
++    D3D11_VIDEO_PROCESSOR_COLOR_SPACE output_cs = {
++        .Usage         = 0,
++        .RGB_Range     = 1, /* studio range; unused for a YUV output */
++        .YCbCr_Matrix  = 1, /* BT.709 */
++        .YCbCr_xvYCC   = 0,
++        .Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235,
++    };
++
++    videoContext->lpVtbl->VideoProcessorSetStreamColorSpace(videoContext, s->processor, 0, &input_cs);
++    videoContext->lpVtbl->VideoProcessorSetOutputColorSpace(videoContext, s->processor, &output_cs);
++}
++
+ static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
+ {
+     AVFilterContext *ctx = inlink->dst;
+@@ -210,6 +248,7 @@ static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
+         s->inputWidth = textureDesc.Width;
+         s->inputHeight = textureDesc.Height;
+         s->input_format = textureDesc.Format;
++        s->in_range = in->color_range;
+ 
+         ret = scale_d3d11_configure_processor(s, ctx);
+         if (ret < 0) {
+@@ -266,6 +305,8 @@ static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
+         goto fail;
+     }
+ 
++    scale_d3d11_set_colorspace(s, videoContext);
++
+     ///< Process the frame
+     hr = videoContext->lpVtbl->VideoProcessorBlt(videoContext, s->processor, s->outputView, 0, 1, &stream);
+     if (FAILED(hr)) {
+@@ -286,6 +327,8 @@ static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
+     out->width = s->width;
+     out->height = s->height;
+     out->format = AV_PIX_FMT_D3D11;
++    out->color_range = AVCOL_RANGE_MPEG; /* output is now studio/limited range */
++    out->colorspace  = AVCOL_SPC_BT709;
+ 
+     ///< Clean up resources
+     inputView->lpVtbl->Release(inputView);

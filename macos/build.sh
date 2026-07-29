@@ -24,7 +24,18 @@ git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git "${BUI
 meson setup "${BUILD_TMP}/openh264/build" "${BUILD_TMP}/openh264" --prefix="$OPENH264_PREFIX" --libdir=lib
 ninja -C "${BUILD_TMP}/openh264/build" install
 
-export PKG_CONFIG_PATH="${OPENH264_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+# libopus (BSD-licensed) for Opus audio encode/decode. Uses the release
+# tarball (ships a pre-generated ./configure) rather than a git clone of the
+# tag, which would need autoreconf (autoconf/automake/libtool + a network
+# fetch) to produce configure.
+OPUS_PREFIX="${BUILD_TMP}/opus-install"
+curl -L -o "${BUILD_TMP}/opus.tar.gz" https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz
+mkdir "${BUILD_TMP}/opus"
+tar -xzf "${BUILD_TMP}/opus.tar.gz" -C "${BUILD_TMP}/opus" --strip-components=1
+mkdir "${BUILD_TMP}/opus/build"
+( cd "${BUILD_TMP}/opus/build" && ../configure --prefix="$OPUS_PREFIX" --disable-shared --enable-static --disable-doc --disable-extra-programs --with-pic && make -j"$(sysctl -n hw.ncpu)" && make install )
+
+export PKG_CONFIG_PATH="${OPENH264_PREFIX}/lib/pkgconfig:${OPUS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 cd "$FFMPEG_SRC"
 
@@ -65,18 +76,27 @@ cd "$FFMPEG_SRC"
   --enable-muxer=flv \
   --enable-parser=h264 \
   --enable-parser=hevc \
+  --enable-parser=opus \
   --enable-bsf=h264_mp4toannexb \
   --enable-bsf=hevc_mp4toannexb \
-  --enable-filter=scale \
   --enable-filter=format \
+  --enable-filter=scale \
   --enable-filter=null \
+  --enable-filter=aformat \
+  --enable-filter=anull \
+  --enable-swscale \
+  --enable-swresample \
   --enable-videotoolbox \
   --enable-libopenh264 \
+  --enable-libopus \
   --enable-encoder=h264_videotoolbox \
   --enable-encoder=hevc_videotoolbox \
   --enable-encoder=libopenh264 \
+  --enable-encoder=libopus \
+  --enable-decoder=libopus \
   --extra-cflags="-Os -ffunction-sections -fdata-sections" \
-  --extra-ldflags="-Wl,-dead_strip -L${OPENH264_PREFIX}/lib -Wl,-rpath,${OPENH264_PREFIX}/lib"
+  --extra-ldflags="-Wl,-dead_strip -L${OPENH264_PREFIX}/lib -L${OPUS_PREFIX}/lib -Wl,-rpath,${OPENH264_PREFIX}/lib" \
+  --extra-libs="-lm"
 
 make -j"$(sysctl -n hw.ncpu)"
 make install
