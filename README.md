@@ -1,14 +1,17 @@
 # ffmpeg マルチプラットフォームビルド（最小構成）
 
 `ffmpeg` バイナリを Linux / Windows / macOS 向けにビルドするための設定一式。
-**H.264/H.265 のハードウェアエンコード専用**の最小構成で、音声コーデック・
-ソフトウェアデコーダ・ffprobe/ffplay は一切含めない。すべて共有ライブラリ
-(`--enable-shared --disable-static`) でビルドし、静的リンクは行わない。
+**H.264/H.265 のハードウェアエンコードと Opus 音声エンコード/デコードに絞った**
+最小構成で、H.264/HEVC 以外のソフトウェアデコーダ・ffprobe/ffplay は含めない。
+すべて共有ライブラリ (`--enable-shared --disable-static`) でビルドし、静的リンク
+は行わない。
 
 想定用途: 画面キャプチャ（Windows: ddagrab, Linux: xcbgrab/kmsgrab,
 macOS: avfoundation）や raw 映像入力を、ハードウェアエンコーダで
-H.264/H.265 にリアルタイムエンコードする。既存の圧縮済み動画を読み込んで
-デコード・トランスコードする用途には使えない（デコーダを一切含まないため）。
+H.264/H.265 にリアルタイムエンコードし、必要に応じて Opus 音声（Windows は
+`wasapi_loopback.exe` によるシステム音声ループバック録音）を同じ MP4 に
+まとめる用途。既存の圧縮済み動画を読み込んでデコード・トランスコードする
+用途には使えない（H.264/HEVC 以外のデコーダを含まないため）。
 
 ## リポジトリ構成
 
@@ -68,6 +71,7 @@ H.265 は各プラットフォームのハードウェアエンコーダのみ�
 | コンポーネント | ライセンス | 備考 |
 |---|---|---|
 | openh264 (Cisco) | BSD-2-Clause | H.264 ソフトウェアエンコーダ(フォールバック) |
+| libopus (Xiph.Org) | BSD-3-Clause | Opus 音声エンコード/デコード |
 | nv-codec-headers | MIT | NVENC 用ヘッダのみ、ライブラリ実体は非搭載 |
 | Intel libvpl (oneVPL) | MIT | QSV 用ヘッダ/ローダのみ |
 | AMD AMF ヘッダ | MIT | AMF 用ヘッダのみ |
@@ -198,7 +202,105 @@ API だが、Rockchip など一部の ARM SoC ベンダーが VA-API 互換ド�
 通ることまでの確認）。NVENC/QSV/AMF は arm64 向けのベンダー SDK 自体が
 提供されていないため非対応。
 
-## 既知の制約・未検証事項
+## 既存 FFmpeg (アップストリーム) からの変更点
+
+このリポジトリは configure フラグでの機能選別に加え、`ffmpeg-src/` に対する
+ソースパッチ（`patches/`、submodule には焼き込まずビルドのたびに適用）と、
+FFmpeg 本体には無い独自ツール（`tools/`）を含む。アップストリームの素の
+FFmpeg には無い、このリポジトリ固有の変更・追加は以下の通り。
+
+### Opus 音声対応
+
+全プラットフォームで `libopus`（BSD-3-Clause、`downloads.xiph.org` の
+リリース tarball からクロス/ネイティブビルド）を組み込み、`--enable-libopus`
++ `libopus` エンコーダ/デコーダ + `opus` パーサーを有効化。あわせて
+`swscale`/`swresample` も全プラットフォームで有効化した（後述の色範囲
+修正で GPU 非搭載パス向けに `scale` フィルタが必要になったため）。
+MP4/MOV/Matroska/MPEG-TS/FLV への Opus 格納に対応する。
+
+- Windows arm64 (llvm-mingw) 向けには opus のビルドに `--disable-rtcd`
+  が必要（ARM NEON のランタイム CPU検出が Windows-on-ARM に未対応でコン
+  パイルエラーになるため）。
+- opus 単体のビルドでは `_FORTIFY_SOURCE` 起因のリンクエラー
+  (`__memcpy_chk` 等) が mingw で発生するため `-D_FORTIFY_SOURCE=0` で
+  無効化し、`libm`（`sqrtf`/`cos` 等）を `--extra-libs=-lm` で明示リンク
+  している。
+
+### WASAPI ループバック録音ヘルパー (`tools/wasapi-loopback/`)
+
+FFmpeg には Windows 向けの音声入力デバイスが `dshow`（DirectShow）しか無く、
+システム音声（スピーカー出力）をそのままループバック録音する標準的な手段が
+無い。このリポジトリでは `wasapi_loopback.exe` という独立した小さな C++
+ヘルパーを追加し、WASAPI (`IAudioClient` の `AUDCLNT_STREAMFLAGS_LOOPBACK`)
+経由でデフォルト再生デバイスの音声を raw float32 PCM として標準出力に
+垂れ流す。Windows ビルドの `bin/` に同梱され、`ffmpeg.exe` の標準入力に
+パイプで直結して `-f f32le -i -` として読み込み、Opus エンコード後に
+映像（ddagrab）と MP4 に多重化する使い方を想定する
+（`scripts/test-ddagrab-record.py --with-audio` 参照）。
+
+### ddagrab の UAC (secure desktop) 遷移からの自動復旧
+
+アップストリームの `ddagrab` は、UAC の同意プロンプト表示（secure desktop /
+Winlogon への遷移）で `IDXGIOutputDuplication` が無効化されると
+`AcquireNextFrame`/`ReleaseFrame` が `DXGI_ERROR_ACCESS_LOST`/
+`E_ACCESSDENIED`/`DXGI_ERROR_INVALID_CALL` を返し、キャプチャが致命的に
+停止してしまう（フィルタグラフ全体がエラー終了する）既知の問題がある。
+`patches/ddagrab-uac-recovery.patch` により、これらのエラーを検知した際に
+致命的エラーとして扱わず、同じ D3D11 デバイス・同じ出力（`output_idx` /
+本リポジトリで追加した `output_name` のどちらでも）で duplication を
+再構築しながら `EAGAIN`（「まだ新しいフレームがない」）を返し続けるように
+変更した。デスクトップ切り替え直後は `DuplicateOutput(1)` が一時的に
+`E_ACCESSDENIED` で失敗し続けることがあるため、再構築失敗時は短い待機を
+挟んで再試行する。これにより、録画中に UAC プロンプトが表示されても
+（ユーザーの応答を待つ間も）録画プロセス自体は落ちず、通常のデスクトップに
+戻り次第キャプチャが自動的に再開される。
+
+### ddagrab の色範囲（full range / limited range）バグ修正
+
+`ddagrab`（Desktop Duplication）が出力する BGRA は full range (0-255) だが、
+これを何も考慮せず YUV 系エンコーダに渡すと limited range (16-235) として
+誤って解釈され、キャプチャ → エンコード → デコード → 再生の経路で黒が
+浮く/色が沈む（コントラストが変わる）症状が出る。対処は経路によって異なる:
+
+- **GPU ハードウェアエンコードパス** (`h264_nvenc`/`h264_amf`/`hevc_nvenc`/
+  `hevc_amf`): `hwdownload` を挟まず GPU 上で完結させるため、`scale_d3d11`
+  フィルタ（D3D11 Video Processor 経由の GPU スケーラー）にパッチ
+  (`patches/scale_d3d11-colorspace.patch`) を当て、`VideoProcessorSetStream
+  ColorSpace`/`VideoProcessorSetOutputColorSpace` で入力(full range, BT.709)・
+  出力(studio/limited range, BT.709) のカラースペースを明示設定するように
+  変更した。アップストリームの `scale_d3d11` はこれを一切設定せず、
+  D3D11 Video Processor のデフォルト解釈に任せていたため範囲が化けていた。
+- **CPU ソフトウェアエンコードパス** (`libopenh264`): `hwdownload` で
+  CPU側に降ろした後、`swscale` の `scale` フィルタで
+  `in_range=full:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709`
+  を明示して正しく変換する。
+
+いずれのパスも、変換後の実データに合わせてビットストリーム/コンテナ側にも
+`-color_range`/`-colorspace`/`-color_primaries`/`-color_trc` を明示する
+（`scripts/test-ddagrab-record.py` 参照）。
+
+### ddagrab のモニタ指定を安定化する `output_name` オプション
+
+アップストリームの `ddagrab` はキャプチャするモニタを `output_idx`
+（`IDXGIAdapter::EnumOutputs` の列挙順インデックス）でしか指定できない。
+これはモニタの抜き差しや再検出（スリープ復帰等）で値が変わりうる不安定な
+識別子である。`patches/ddagrab-output-name.patch` により `output_name`
+オプションを追加し、`DXGI_OUTPUT_DESC.DeviceName`（例: `\\.\DISPLAY1`）に
+よるマッチングでモニタを指定できるようにした。`output_idx` は変更しておらず
+デフォルトのまま使用可能、`output_name` を指定した場合のみそちらが優先
+される（初回のキャプチャ開始時・UAC 復旧後の再キャプチャ開始時の両方で
+一貫して適用される）。同一アダプタ内の出力から探すという既存の
+`output_idx` と同じ検索スコープであり、別アダプタに繋がるモニタへの対応
+範囲拡大は行っていない。
+
+### ビルド設定の変更
+
+- 全プラットフォームで `-flto` を撤回した。LTO を有効にすると `libswscale`
+  の x86 アセンブリ由来オブジェクトのリンクに失敗する
+  （Windows: undefined reference、Linux: PIC 未対応によるリロケーション
+  エラー）ため、削減できるサイズよりリスクが上回ると判断した。
+
+
 
 - Windows 向け Intel QSV (libvpl) のクロスビルドは複雑なため未対応。
 - Windows arm64 は Debian の apt に `gcc-mingw-w64-aarch64` が無いため
