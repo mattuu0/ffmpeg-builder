@@ -9,6 +9,12 @@ ddagrab (Windows Desktop Duplication) でデスクトップ映像を、wasapi_lo
 wasapi_loopback.exe は別プロセスとして起動し、標準出力の raw PCM を
 ffmpeg の標準入力にパイプで直結して渡す。
 
+キャプチャするモニタは --output-idx (列挙順のインデックス、モニタの
+抜き差しや再検出で変わりうる) または --output-name (DXGI の DeviceName、
+例: \\\\.\\DISPLAY1。ddagrab の output_name オプション、要
+patches/ddagrab-output-name.patch 適用ビルド) のどちらかで指定する。
+--output-name を指定した場合はそちらが優先される。
+
 コーデックは既定で H.264、--codec h265 で H.265(HEVC) に切り替えられる。
 エンコーダは明示しない限り、コーデックごとに nvenc -> amf -> (H.264のみ)
 openh264 software の順で自動フォールバックする
@@ -130,8 +136,22 @@ def select_encoder(ffmpeg_path, codec, requested):
     )
 
 
-def get_video_filter_complex(output_idx, framerate, encoder_name):
-    ddagrab = f"ddagrab=output_idx={output_idx}:framerate={framerate}"
+def escape_filter_option_value(value):
+    # ffmpeg のフィルタグラフ構文では \ と : と ' が特別な意味を持つため、
+    # output_name (例: \\.\DISPLAY1) をそのまま埋め込むと壊れる。
+    # バックスラッシュでエスケープする。
+    return value.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def get_video_filter_complex(output_idx, output_name, framerate, encoder_name):
+    if output_name:
+        # output_name はモニタの抜き差しや再検出があっても output_idx
+        # (単なる列挙順) より安定した識別子 (DXGI DeviceName) で
+        # モニタを指定する。output_idx より優先される。
+        escaped = escape_filter_option_value(output_name)
+        ddagrab = f"ddagrab=output_name='{escaped}':framerate={framerate}"
+    else:
+        ddagrab = f"ddagrab=output_idx={output_idx}:framerate={framerate}"
 
     if encoder_name in GPU_PATH_ENCODERS:
         # GPU 上で D3D11 Video Processor (scale_d3d11, パッチ適用済み) を使い、
@@ -245,7 +265,14 @@ def run_interactive_prompts(args):
     print("Enter キーのみで [] 内のデフォルト値を使用します。\n")
 
     args.duration = prompt_int("録画時間 (秒)", args.duration)
-    args.output_idx = prompt_int("モニタ index (0=プライマリ)", args.output_idx)
+    output_name_input = prompt_str(
+        "モニタのデバイス名 (例: \\\\.\\DISPLAY1、空欄で index 指定を使う)",
+        args.output_name or "",
+    )
+    if output_name_input:
+        args.output_name = output_name_input
+    else:
+        args.output_idx = prompt_int("モニタ index (0=プライマリ)", args.output_idx)
     args.framerate = prompt_int("フレームレート (fps)", args.framerate)
     args.codec = prompt_str("コーデック (h264 / h265)", args.codec)
 
@@ -278,6 +305,12 @@ def parse_args(argv):
     parser.add_argument("--duration", type=int, default=30, help="録画時間 (秒)")
     parser.add_argument(
         "--output-idx", dest="output_idx", type=int, default=0, help="ddagrab の output_idx"
+    )
+    parser.add_argument(
+        "--output-name",
+        dest="output_name",
+        default=None,
+        help=r"ddagrab の output_name (例: \\.\DISPLAY1)。指定時は --output-idx より優先される",
     )
     parser.add_argument("--framerate", type=int, default=30)
     parser.add_argument(
@@ -348,12 +381,17 @@ def main():
     output_path = output_path.resolve()
 
     selected_encoder = select_encoder(ffmpeg_path, args.codec, args.encoder)
-    video_filter_complex = get_video_filter_complex(args.output_idx, args.framerate, selected_encoder)
+    video_filter_complex = get_video_filter_complex(
+        args.output_idx, args.output_name, args.framerate, selected_encoder
+    )
     video_encoder_args = get_video_encoder_args(selected_encoder)
 
     print()
     print("=== ddagrab 録画テスト ===")
-    print(f"  モニタ index : {args.output_idx}")
+    if args.output_name:
+        print(f"  モニタ       : {args.output_name}")
+    else:
+        print(f"  モニタ index : {args.output_idx}")
     print(f"  フレームレート: {args.framerate} fps")
     print(f"  録画時間     : {args.duration} 秒")
     print(f"  コーデック   : {args.codec}")

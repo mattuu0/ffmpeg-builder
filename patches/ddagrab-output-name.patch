@@ -1,0 +1,149 @@
+--- a/libavfilter/vsrc_ddagrab.c
++++ b/libavfilter/vsrc_ddagrab.c
+@@ -24,6 +24,7 @@
+ #endif
+ 
+ #include <windows.h>
++#include <wchar.h>
+ 
+ #define COBJMACROS
+ 
+@@ -95,6 +96,7 @@
+     ID3D11BlendState *blend_state_xor;
+ 
+     int        output_idx;
++    char       *output_name;
+     int        draw_mouse;
+     AVRational framerate;
+     int        width;
+@@ -111,6 +113,8 @@
+ #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
+ static const AVOption ddagrab_options[] = {
+     { "output_idx", "dda output index to capture", OFFSET(output_idx), AV_OPT_TYPE_INT,        { .i64 = 0    },       0, INT_MAX, FLAGS },
++    { "output_name", "dda output device name to capture (e.g. \\\\.\\DISPLAY1), overrides output_idx if set",
++                                                   OFFSET(output_name), AV_OPT_TYPE_STRING,     { .str = NULL },       0,       0, FLAGS },
+     { "draw_mouse", "draw the mouse pointer",      OFFSET(draw_mouse), AV_OPT_TYPE_BOOL,       { .i64 = 1    },       0,       1, FLAGS },
+     { "framerate",  "set video frame rate",        OFFSET(framerate),  AV_OPT_TYPE_VIDEO_RATE, { .str = "30" },       0, INT_MAX, FLAGS },
+     { "video_size", "set video frame size",        OFFSET(width),      AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL },       0,       0, FLAGS },
+@@ -170,6 +174,67 @@
+     av_buffer_unref(&dda->device_ref);
+ }
+ 
++/*
++ * output_idx is just the enumeration order DXGI happens to return outputs
++ * in, which is not a stable monitor identity: it can shift whenever a
++ * monitor is unplugged/replugged, a display is disabled/re-enabled, or
++ * Windows re-detects the display topology (e.g. waking from sleep). For a
++ * user-facing "which monitor do I record" setting, output_name (matched
++ * against DXGI_OUTPUT_DESC.DeviceName, e.g. "\\.\DISPLAY1") is far more
++ * stable across those events, though it can still change if the physical
++ * output port a monitor is plugged into changes.
++ *
++ * Only searches outputs on the given (already-selected) adapter, matching
++ * the existing output_idx behavior -- ddagrab captures via one specific
++ * D3D11 device/adapter, so a monitor attached to a different adapter was
++ * never reachable via output_idx either and isn't a new limitation here.
++ */
++static int find_output_by_name(AVFilterContext *avctx, IDXGIAdapter *dxgi_adapter,
++                                const char *output_name, IDXGIOutput **out_output)
++{
++    HRESULT hr;
++    UINT idx;
++    WCHAR wanted[32];
++
++    /* DXGI_OUTPUT_DESC.DeviceName is a fixed WCHAR[32] buffer (e.g.
++     * L"\\.\DISPLAY1"); MultiByteToWideChar converts the UTF-8 AVOption
++     * string to match it for comparison. */
++    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, output_name, -1, wanted, FF_ARRAY_ELEMS(wanted))) {
++        av_log(avctx, AV_LOG_ERROR, "find_output_by_name: output_name \"%s\" is not valid UTF-8 or too long\n", output_name);
++        return AVERROR(EINVAL);
++    }
++
++    for (idx = 0; ; idx++) {
++        IDXGIOutput *candidate = NULL;
++        DXGI_OUTPUT_DESC desc;
++
++        hr = IDXGIAdapter_EnumOutputs(dxgi_adapter, idx, &candidate);
++        if (hr == DXGI_ERROR_NOT_FOUND)
++            break;
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "find_output_by_name: EnumOutputs failed at index %u: %lx\n", idx, hr);
++            return AVERROR_EXTERNAL;
++        }
++
++        hr = IDXGIOutput_GetDesc(candidate, &desc);
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "find_output_by_name: GetDesc failed at index %u: %lx\n", idx, hr);
++            release_resource(&candidate);
++            return AVERROR_EXTERNAL;
++        }
++
++        if (!wcscmp(desc.DeviceName, wanted)) {
++            *out_output = candidate;
++            return 0;
++        }
++
++        release_resource(&candidate);
++    }
++
++    av_log(avctx, AV_LOG_ERROR, "find_output_by_name: no output named \"%s\" found on this adapter\n", output_name);
++    return AVERROR(ENODEV);
++}
++
+ static av_cold int init_dxgi_dda(AVFilterContext *avctx)
+ {
+     DdagrabContext *dda = avctx->priv;
+@@ -201,12 +266,20 @@
+         return AVERROR_EXTERNAL;
+     }
+ 
+-    hr = IDXGIAdapter_EnumOutputs(dxgi_adapter, dda->output_idx, &dxgi_output);
+-    IDXGIAdapter_Release(dxgi_adapter);
+-    dxgi_adapter = NULL;
+-    if (FAILED(hr)) {
+-        av_log(avctx, AV_LOG_ERROR, "Failed to enumerate DXGI output %d\n", dda->output_idx);
+-        return AVERROR_EXTERNAL;
++    if (dda->output_name) {
++        int ret = find_output_by_name(avctx, dxgi_adapter, dda->output_name, &dxgi_output);
++        IDXGIAdapter_Release(dxgi_adapter);
++        dxgi_adapter = NULL;
++        if (ret < 0)
++            return ret;
++    } else {
++        hr = IDXGIAdapter_EnumOutputs(dxgi_adapter, dda->output_idx, &dxgi_output);
++        IDXGIAdapter_Release(dxgi_adapter);
++        dxgi_adapter = NULL;
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "Failed to enumerate DXGI output %d\n", dda->output_idx);
++            return AVERROR_EXTERNAL;
++        }
+     }
+ 
+     hr = IDXGIOutput_GetDesc(dxgi_output, &dda->output_desc);
+@@ -506,12 +579,20 @@
+     if (ret < 0)
+         return ret;
+ 
+-    hr = IDXGIAdapter_EnumOutputs(dxgi_adapter, dda->output_idx, &dxgi_output);
+-    IDXGIAdapter_Release(dxgi_adapter);
+-    dxgi_adapter = NULL;
+-    if (FAILED(hr)) {
+-        av_log(avctx, AV_LOG_ERROR, "recover_duplication: Failed to enumerate DXGI output %d: %lx\n", dda->output_idx, hr);
+-        return AVERROR_EXTERNAL;
++    if (dda->output_name) {
++        ret = find_output_by_name(avctx, dxgi_adapter, dda->output_name, &dxgi_output);
++        IDXGIAdapter_Release(dxgi_adapter);
++        dxgi_adapter = NULL;
++        if (ret < 0)
++            return ret;
++    } else {
++        hr = IDXGIAdapter_EnumOutputs(dxgi_adapter, dda->output_idx, &dxgi_output);
++        IDXGIAdapter_Release(dxgi_adapter);
++        dxgi_adapter = NULL;
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "recover_duplication: Failed to enumerate DXGI output %d: %lx\n", dda->output_idx, hr);
++            return AVERROR_EXTERNAL;
++        }
+     }
+ 
+ #if HAVE_IDXGIOUTPUT5

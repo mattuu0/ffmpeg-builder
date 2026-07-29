@@ -160,6 +160,18 @@ RUN cd /build && \
     (echo "FATAL: scale_d3d11-colorspace.patch failed to apply -- upstream ffmpeg-src/libavfilter/vf_scale_d3d11.c likely changed. Manual patch rebase required." >&2; \
      cat /tmp/patch-check2.log >&2; exit 1)
 
+# Adds ddagrab's output_name option (select a monitor by its stable DXGI
+# DeviceName, e.g. \\.\DISPLAY1, instead of the enumeration-order-dependent
+# output_idx). Depends on the UAC recovery patch above (extends
+# recover_duplication()), so must be applied after it.
+COPY patches/ddagrab-output-name.patch /tmp/ddagrab-output-name.patch
+RUN cd /build && \
+    (git apply --check /tmp/ddagrab-output-name.patch 2>/tmp/patch-check3.log && \
+     git apply /tmp/ddagrab-output-name.patch && \
+     echo "ddagrab-output-name.patch applied successfully") || \
+    (echo "FATAL: ddagrab-output-name.patch failed to apply -- upstream ffmpeg-src/libavfilter/vsrc_ddagrab.c likely changed. Manual patch rebase required." >&2; \
+     cat /tmp/patch-check3.log >&2; exit 1)
+
 # ---------------------------------------------------------------------------
 # configure flags — edit below to add/remove features for the Windows build.
 #
