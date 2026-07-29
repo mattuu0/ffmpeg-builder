@@ -194,9 +194,9 @@ RUN make -j"$(nproc)" && make install
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then MINGW_PREFIX=x86_64-w64-mingw32; else MINGW_PREFIX=aarch64-w64-mingw32; fi; \
     cp "/usr/${MINGW_PREFIX}/bin/libopenh264"*.dll /dist/bin/; \
-    winpthread_dll=$(find "/usr/${MINGW_PREFIX}" -iname 'libwinpthread-*.dll' | head -n1); \
+    winpthread_dll=$(find "/usr/${MINGW_PREFIX}" /opt/llvm-mingw -iname 'libwinpthread-*.dll' 2>/dev/null | head -n1); \
     if [ -z "$winpthread_dll" ]; then \
-      echo "FATAL: libwinpthread-*.dll not found under /usr/${MINGW_PREFIX}" >&2; exit 1; \
+      echo "FATAL: libwinpthread-*.dll not found under /usr/${MINGW_PREFIX} or /opt/llvm-mingw" >&2; exit 1; \
     fi; \
     cp "$winpthread_dll" /dist/bin/
 
