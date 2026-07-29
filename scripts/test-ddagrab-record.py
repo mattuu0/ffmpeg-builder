@@ -28,13 +28,16 @@ capture -> encode -> decode -> 再生 の経路で色が沈む/褪せる (黒が
 コントラストが変わる) 症状が出る。
 
   * h264_nvenc / h264_amf / hevc_nvenc / hevc_amf (GPU ハードウェアパス):
-    ddagrab が出す D3D11 ハードウェアフレームを hwdownload せず、GPU 上の
-    scale_d3d11 フィルタ (D3D11 Video Processor 経由) で BGRA(full range)
-    -> NV12(limited range, BT.709) に変換してからエンコーダへ渡す。
-    scale_d3d11 は patches/scale_d3d11-colorspace.patch により明示的に
-    color space/range を設定するようパッチ済み (パッチ未適用のアップストリーム
-    ビルドでは range が化ける可能性があるため、必ずパッチ適用済みビルドを使うこと)。
-    GPU->CPU->GPU の転送コストを避けられるのが利点。
+    ddagrab が出す D3D11 ハードウェアフレーム (BGRA, full range) を
+    hwdownload せず、そのままエンコーダに渡す (GPU->GPU、変換ステップなし)。
+    実際の pixel データの range 変換はエンコーダ内部の RGB->YUV 変換に
+    任せ、そのフレームが full range であることをビットストリーム/
+    コンテナのメタデータ (-color_range pc 等) で明示することで、
+    デコード側 (再生プレイヤー) が正しく解釈できるようにする。
+    以前は scale_d3d11 フィルタ (D3D11 Video Processor) で GPU 上の
+    range 変換を試みたが、環境によっては scale_d3d11 が要求する NV12
+    ハードウェアフレームの確保自体が D3D11 の CreateTexture2D で
+    E_INVALIDARG になり失敗するケースが確認されたため廃止した。
 
   * libopenh264 (CPU ソフトウェアエンコーダ):
     CPU 側のフレームが必要なため hwdownload で明示的に落とし、
@@ -137,10 +140,10 @@ def get_video_filter_complex(output_idx, output_name, framerate, encoder_name):
         ddagrab = f"ddagrab=output_idx={output_idx}:framerate={framerate}"
 
     if encoder_name in GPU_PATH_ENCODERS:
-        # GPU 上で D3D11 Video Processor (scale_d3d11, パッチ適用済み) を使い、
-        # hwdownload なしで BGRA(full range) -> NV12(limited range, BT.709)
-        # に変換する。GPU->CPU->GPU の転送コストを避けられる。
-        return f"{ddagrab},scale_d3d11=format=nv12[vout]"
+        # hwdownload なし、変換フィルタなしでそのままエンコーダに渡す
+        # (GPU->GPU ゼロコピー)。full range であることは
+        # get_video_encoder_args() 側の -color_range pc で明示する。
+        return f"{ddagrab}[vout]"
 
     # libopenh264 (CPU ソフトウェアエンコーダ) は CPU 側のフレームが必要なため
     # hwdownload で明示的に落とし、scale (swscale) で range 変換してから渡す。
@@ -151,12 +154,17 @@ def get_video_filter_complex(output_idx, output_name, framerate, encoder_name):
     )
 
 
-# GPU パス (scale_d3d11 が出力段で明示的に limited/BT.709 をフレームに
-# タグ付け済み) と CPU パス (scale フィルタで同様に limited/BT.709 済み) の
-# どちらも、最終的なピクセルデータは limited range の BT.709 になっている。
-# コンテナ/ビットストリームのメタデータにも同じ range/colorspace を明示し、
-# デコード側 (再生プレイヤー) が正しく解釈できるようにする。
-COLOR_RANGE_ARGS = [
+# GPU パス: ddagrab の生フレーム (BGRA, full range) をそのまま渡すため、
+# ビットストリーム/コンテナのメタデータで "full range" であることを明示する
+# (-color_range pc)。実際の RGB->YUV 変換はエンコーダ内部に任せる。
+GPU_PATH_COLOR_RANGE_ARGS = [
+    "-color_range", "pc", "-colorspace", "bt709",
+    "-color_primaries", "bt709", "-color_trc", "bt709",
+]
+
+# CPU パス: scale フィルタで既に limited range (tv) に変換済みなので、
+# そちらのメタデータを明示する。
+CPU_PATH_COLOR_RANGE_ARGS = [
     "-color_range", "tv", "-colorspace", "bt709",
     "-color_primaries", "bt709", "-color_trc", "bt709",
 ]
@@ -164,15 +172,15 @@ COLOR_RANGE_ARGS = [
 
 def get_video_encoder_args(encoder_name):
     if encoder_name == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-b:v", "8M"] + COLOR_RANGE_ARGS
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-b:v", "8M"] + GPU_PATH_COLOR_RANGE_ARGS
     if encoder_name == "h264_amf":
-        return ["-c:v", "h264_amf", "-quality", "balanced", "-b:v", "8M"] + COLOR_RANGE_ARGS
+        return ["-c:v", "h264_amf", "-quality", "balanced", "-b:v", "8M"] + GPU_PATH_COLOR_RANGE_ARGS
     if encoder_name == "libopenh264":
-        return ["-c:v", "libopenh264", "-b:v", "8M"] + COLOR_RANGE_ARGS
+        return ["-c:v", "libopenh264", "-b:v", "8M"] + CPU_PATH_COLOR_RANGE_ARGS
     if encoder_name == "hevc_nvenc":
-        return ["-c:v", "hevc_nvenc", "-preset", "p4", "-rc", "vbr", "-b:v", "8M"] + COLOR_RANGE_ARGS
+        return ["-c:v", "hevc_nvenc", "-preset", "p4", "-rc", "vbr", "-b:v", "8M"] + GPU_PATH_COLOR_RANGE_ARGS
     if encoder_name == "hevc_amf":
-        return ["-c:v", "hevc_amf", "-quality", "balanced", "-b:v", "8M"] + COLOR_RANGE_ARGS
+        return ["-c:v", "hevc_amf", "-quality", "balanced", "-b:v", "8M"] + GPU_PATH_COLOR_RANGE_ARGS
     raise ValueError(f"未対応のエンコーダです: {encoder_name}")
 
 

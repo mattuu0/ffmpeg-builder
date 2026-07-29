@@ -135,18 +135,6 @@ RUN cd /build && \
     (echo "FATAL: ddagrab-uac-recovery.patch failed to apply -- upstream ffmpeg-src/libavfilter/vsrc_ddagrab.c likely changed. Manual patch rebase required." >&2; \
      cat /tmp/patch-check.log >&2; exit 1)
 
-# Fixes scale_d3d11 (GPU BGRA->NV12 conversion used ahead of hardware H.264/
-# HEVC encoders) silently defaulting to the wrong color range, which crushes
-# blacks / fades colors once the encoded video is decoded and played back
-# downstream. See patch header for full explanation.
-COPY patches/scale_d3d11-colorspace.patch /tmp/scale_d3d11-colorspace.patch
-RUN cd /build && \
-    (git apply --check /tmp/scale_d3d11-colorspace.patch 2>/tmp/patch-check2.log && \
-     git apply /tmp/scale_d3d11-colorspace.patch && \
-     echo "scale_d3d11-colorspace.patch applied successfully") || \
-    (echo "FATAL: scale_d3d11-colorspace.patch failed to apply -- upstream ffmpeg-src/libavfilter/vf_scale_d3d11.c likely changed. Manual patch rebase required." >&2; \
-     cat /tmp/patch-check2.log >&2; exit 1)
-
 # Adds ddagrab's output_name option (select a monitor by its stable DXGI
 # DeviceName, e.g. \\.\DISPLAY1, instead of the enumeration-order-dependent
 # output_idx). Depends on the UAC recovery patch above (extends
@@ -222,7 +210,6 @@ RUN set -eux; \
       --disable-debug \
       --enable-d3d11va \
       --enable-filter=ddagrab \
-      --enable-filter=scale_d3d11 \
       --enable-avdevice \
       --enable-indev=wasapi \
       --enable-protocol=file \

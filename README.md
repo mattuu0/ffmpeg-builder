@@ -272,13 +272,19 @@ Winlogon への遷移）で `IDXGIOutputDuplication` が無効化されると
 浮く/色が沈む（コントラストが変わる）症状が出る。対処は経路によって異なる:
 
 - **GPU ハードウェアエンコードパス** (`h264_nvenc`/`h264_amf`/`hevc_nvenc`/
-  `hevc_amf`): `hwdownload` を挟まず GPU 上で完結させるため、`scale_d3d11`
-  フィルタ（D3D11 Video Processor 経由の GPU スケーラー）にパッチ
-  (`patches/scale_d3d11-colorspace.patch`) を当て、`VideoProcessorSetStream
-  ColorSpace`/`VideoProcessorSetOutputColorSpace` で入力(full range, BT.709)・
-  出力(studio/limited range, BT.709) のカラースペースを明示設定するように
-  変更した。アップストリームの `scale_d3d11` はこれを一切設定せず、
-  D3D11 Video Processor のデフォルト解釈に任せていたため範囲が化けていた。
+  `hevc_amf`): `hwdownload` も変換フィルタも挟まず、`ddagrab` の D3D11
+  ハードウェアフレーム (BGRA, full range) をそのままエンコーダに渡す
+  (GPU->GPU ゼロコピー)。実データの range 変換はエンコーダ内部の
+  RGB->YUV 変換に任せ、そのフレームが full range であることを
+  `-color_range pc` でビットストリーム/コンテナのメタデータに明示する
+  ことで、デコード側 (再生プレイヤー) が正しく解釈できるようにする。
+  当初は `scale_d3d11` フィルタ（D3D11 Video Processor 経由の GPU
+  スケーラー）で GPU 上の range 変換を試みたが、環境によっては
+  `scale_d3d11` が要求する NV12 ハードウェアフレームの確保自体が
+  `CreateTexture2D` で `E_INVALIDARG` (0x80070057) になり失敗する
+  ケースが確認されたため、`scale_d3d11` の使用は廃止した
+  （BindFlags の組み合わせを何通り試しても解消しなかったため、
+  BindFlags 起因ではなくフィルタ自体かこのビルドとの相性の問題と判断）。
 - **CPU ソフトウェアエンコードパス** (`libopenh264`): `hwdownload` で
   CPU側に降ろした後、`swscale` の `scale` フィルタで
   `in_range=full:out_range=tv:in_color_matrix=bt709:out_color_matrix=bt709`
