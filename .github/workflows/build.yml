@@ -66,7 +66,7 @@ jobs:
         id: tag
         run: |
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            base_tag="${{ github.ref_name }}"
           else
             # workflow_dispatch (or any non-tag trigger): derive the tag from
             # whatever version ffmpeg-src is currently checked out at, so the
@@ -79,8 +79,17 @@ jobs:
               || (test -f RELEASE && cat RELEASE) \
               || git rev-parse --short HEAD \
             ))
-            echo "tag=v${ffmpeg_ref}" >> "$GITHUB_OUTPUT"
+            base_tag="v${ffmpeg_ref}"
           fi
+
+          # Append the short SHA of this builder repo's commit that produced
+          # the build, so a given FFmpeg version can be released more than
+          # once (e.g. after a builder-side fix) without the tag colliding
+          # with a previous release for the same FFmpeg version. Use HEAD
+          # (not github.sha directly) since actions/checkout already left us
+          # on the exact commit that triggered this run.
+          builder_sha=$(git rev-parse --short HEAD)
+          echo "tag=${base_tag}-${builder_sha}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v4
         with:
