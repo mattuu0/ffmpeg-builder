@@ -69,6 +69,9 @@ RUN set -eux; \
       "strip = '${MINGW_PREFIX}-strip'" \
       "windres = '${MINGW_PREFIX}-windres'" \
       "pkg-config = 'pkg-config'" \
+      "[built-in options]" \
+      "c_link_args = ['-static-libgcc', '-Wl,-Bstatic,-lwinpthread,-Bdynamic']" \
+      "cpp_link_args = ['-static-libgcc', '-static-libstdc++', '-Wl,-Bstatic,-lwinpthread,-Bdynamic']" \
       "[host_machine]" \
       "system = 'windows'" \
       "cpu_family = '$( [ "$ARCH" = "amd64" ] && echo x86_64 || echo aarch64 )'" \
@@ -169,7 +172,8 @@ RUN set -eux; \
            --enable-encoder=h264_amf \
            --enable-encoder=hevc_amf ) \
       --extra-cflags="-Os -ffunction-sections -fdata-sections" \
-      --extra-ldflags="-Wl,--gc-sections -static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
+      --extra-ldflags="-Wl,--gc-sections -static-libgcc -static-libstdc++" \
+      --extra-libs="-Wl,-Bstatic,-lwinpthread,-Bdynamic"
 
 RUN make -j"$(nproc)" && make install
 
@@ -179,9 +183,22 @@ RUN make -j"$(nproc)" && make install
 # openh264's .dll from the mingw sysroot. Without this, ffmpeg.exe fails to
 # start with "libopenh264-7.dll not found" as soon as it's moved outside the
 # build container.
+#
+# libopenh264 also still depends on libwinpthread-1.dll at runtime: its
+# meson.build pulls in Meson's `dependency('threads')`, whose link flags
+# Ninja places after our cross-file's link_args, so the earlier
+# -Wl,-Bstatic,-lwinpthread,-Bdynamic toggle can't reach it (unlike
+# libgcc_s_seh/libstdc++, which the same cross-file successfully statically
+# links). Ship libwinpthread-1.dll alongside instead of fighting Meson's
+# link ordering.
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then MINGW_PREFIX=x86_64-w64-mingw32; else MINGW_PREFIX=aarch64-w64-mingw32; fi; \
-    cp "/usr/${MINGW_PREFIX}/bin/libopenh264"*.dll /dist/bin/
+    cp "/usr/${MINGW_PREFIX}/bin/libopenh264"*.dll /dist/bin/; \
+    winpthread_dll=$(find "/usr/${MINGW_PREFIX}" -iname 'libwinpthread-*.dll' | head -n1); \
+    if [ -z "$winpthread_dll" ]; then \
+      echo "FATAL: libwinpthread-*.dll not found under /usr/${MINGW_PREFIX}" >&2; exit 1; \
+    fi; \
+    cp "$winpthread_dll" /dist/bin/
 
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then STRIP=x86_64-w64-mingw32-strip; else STRIP=aarch64-w64-mingw32-strip; fi; \
