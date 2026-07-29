@@ -1,5 +1,5 @@
 diff --git a/libavfilter/vsrc_ddagrab.c b/libavfilter/vsrc_ddagrab.c
-index e035ac9bc4..c526df368d 100644
+index e035ac9bc4..6aa739224c 100644
 --- a/libavfilter/vsrc_ddagrab.c
 +++ b/libavfilter/vsrc_ddagrab.c
 @@ -65,6 +65,7 @@ typedef struct DdagrabContext {
@@ -10,7 +10,7 @@ index e035ac9bc4..c526df368d 100644
      AVFrame *last_frame;
  
      int mouse_x, mouse_y;
-@@ -322,6 +323,117 @@ static av_cold int init_dxgi_dda(AVFilterContext *avctx)
+@@ -322,6 +323,242 @@ static av_cold int init_dxgi_dda(AVFilterContext *avctx)
      return 0;
  }
  
@@ -33,6 +33,141 @@ index e035ac9bc4..c526df368d 100644
 + * since only one live IDXGIOutputDuplication may exist per output at a
 + * time.
 + */
++/*
++ * Attaches the CALLING thread to the current input desktop (which may
++ * already be the UAC secure desktop, or may have just switched back to the
++ * normal desktop). SetThreadDesktop only affects the thread that calls it,
++ * so this must run on whatever thread is about to touch the DXGI calls
++ * below -- ddagrab's frame-pump thread in this case.
++ *
++ * The desktop access mask is the OR of all DESKTOP_* rights (0x1FF), not
++ * GENERIC_ALL: GENERIC_ALL only has meaning through a security descriptor's
++ * generic-rights mapping, which OpenInputDesktop does not apply to the
++ * dwDesiredAccess it's given directly -- passing it here does not actually
++ * grant the specific desktop rights needed and was observed to make the
++ * following DuplicateOutput(1) fail with E_ACCESSDENIED. DF_ALLOWOTHERACCOUNTHOOK
++ * is required because the desktop may currently be owned by a different
++ * security context (Winlogon's secure desktop runs as SYSTEM) than the
++ * thread reattaching to it.
++ */
++static void attach_input_desktop(AVFilterContext *avctx)
++{
++    const DWORD desktop_access = DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW |
++        DESKTOP_CREATEMENU | DESKTOP_HOOKCONTROL | DESKTOP_JOURNALRECORD |
++        DESKTOP_JOURNALPLAYBACK | DESKTOP_ENUMERATE | DESKTOP_WRITEOBJECTS |
++        DESKTOP_SWITCHDESKTOP;
++    HDESK input_desktop = OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, FALSE, desktop_access);
++
++    if (!input_desktop) {
++        av_log(avctx, AV_LOG_WARNING, "attach_input_desktop: OpenInputDesktop failed: %lu\n", GetLastError());
++        return;
++    }
++
++    if (!SetThreadDesktop(input_desktop))
++        av_log(avctx, AV_LOG_WARNING, "attach_input_desktop: SetThreadDesktop failed: %lu\n", GetLastError());
++
++    CloseDesktop(input_desktop);
++}
++
++/*
++ * Gets the parent IDXGIAdapter for dxgi_device, first checking whether the
++ * DXGI adapter/output topology has become stale (IDXGIFactory1::IsCurrent()
++ * returning FALSE) and, if so, re-fetching the SAME physical adapter (by
++ * AdapterLuid, which identifies a specific GPU and is stable across
++ * topology changes) from a freshly created IDXGIFactory1 instead.
++ *
++ * This is necessary because a virtual display adapter (e.g. a remote-desktop
++ * driver) can tear down and recreate its display device (new PnP instance)
++ * across a rapid secure-desktop<->normal-desktop switch. Simply re-enumerating
++ * outputs on the SAME (possibly now-stale) IDXGIAdapter can still return a
++ * "successful" DuplicateOutput1 against a duplication session that isn't
++ * actually backed by a live display -- i.e. the staleness lives one level up,
++ * on the adapter/factory itself, not just the specific IDXGIOutput object.
++ * IsCurrent() is DXGI's own purpose-built signal for exactly this situation.
++ */
++static int get_current_adapter(AVFilterContext *avctx, IDXGIDevice *dxgi_device, IDXGIAdapter **out_adapter)
++{
++    IDXGIAdapter *adapter = NULL;
++    IDXGIFactory1 *factory = NULL;
++    DXGI_ADAPTER_DESC desc;
++    LUID target_luid;
++    HRESULT hr;
++
++    hr = IDXGIDevice_GetParent(dxgi_device, &IID_IDXGIAdapter, (void**)&adapter);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "get_current_adapter: Failed getting parent IDXGIAdapter: %lx\n", hr);
++        return AVERROR_EXTERNAL;
++    }
++
++    hr = IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory1, (void**)&factory);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "get_current_adapter: Failed getting parent IDXGIFactory1: %lx\n", hr);
++        release_resource(&adapter);
++        return AVERROR_EXTERNAL;
++    }
++
++    if (IDXGIFactory1_IsCurrent(factory)) {
++        release_resource(&factory);
++        *out_adapter = adapter;
++        return 0;
++    }
++
++    av_log(avctx, AV_LOG_VERBOSE, "get_current_adapter: DXGI topology is stale (IsCurrent()==FALSE); re-creating factory/adapter\n");
++
++    hr = IDXGIAdapter_GetDesc(adapter, &desc);
++    release_resource(&adapter);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "get_current_adapter: Failed getting adapter desc: %lx\n", hr);
++        release_resource(&factory);
++        return AVERROR_EXTERNAL;
++    }
++    target_luid = desc.AdapterLuid;
++    release_resource(&factory);
++
++    hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&factory);
++    if (FAILED(hr)) {
++        av_log(avctx, AV_LOG_ERROR, "get_current_adapter: CreateDXGIFactory1 failed: %lx\n", hr);
++        return AVERROR_EXTERNAL;
++    }
++
++    for (UINT index = 0; ; index++) {
++        IDXGIAdapter *candidate = NULL;
++        DXGI_ADAPTER_DESC candidate_desc;
++
++        hr = IDXGIFactory1_EnumAdapters(factory, index, &candidate);
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "get_current_adapter: EnumAdapters exhausted without finding matching LUID: %lx\n", hr);
++            release_resource(&factory);
++            return AVERROR_EXTERNAL;
++        }
++
++        hr = IDXGIAdapter_GetDesc(candidate, &candidate_desc);
++        if (FAILED(hr)) {
++            release_resource(&candidate);
++            continue;
++        }
++
++        if (candidate_desc.AdapterLuid.LowPart == target_luid.LowPart &&
++            candidate_desc.AdapterLuid.HighPart == target_luid.HighPart) {
++            av_log(avctx, AV_LOG_VERBOSE, "get_current_adapter: re-acquired the same physical adapter (luid match) from a fresh factory\n");
++            release_resource(&factory);
++            *out_adapter = candidate;
++            return 0;
++        }
++
++        release_resource(&candidate);
++    }
++}
++
++/* How long to sleep after a failed recover_duplication() attempt before the
++ * caller returns EAGAIN to retry. DuplicateOutput(1) commonly keeps failing
++ * with E_ACCESSDENIED for a brief window right after a desktop switch
++ * (before Windows finishes restoring the normal desktop's access rights),
++ * so retrying immediately in a tight loop would just busy-spin; a short
++ * delay gives that window time to close while keeping the retry cadence
++ * fast enough to resume capture quickly once it does. */
++#define DDAGRAB_RECOVERY_RETRY_DELAY_US (500 * 1000)
++
 +static int recover_duplication(AVFilterContext *avctx)
 +{
 +    DdagrabContext *dda = avctx->priv;
@@ -44,15 +179,9 @@ index e035ac9bc4..c526df368d 100644
 +    IDXGIOutput5 *dxgi_output5 = NULL;
 +#endif
 +    HRESULT hr;
++    int ret;
 +
-+    /* Re-attach this thread to whatever is currently the input desktop:
-+     * a cached desktop attachment from before the UAC transition is not
-+     * valid for talking to the (now restored) user desktop. */
-+    HDESK input_desktop = OpenInputDesktop(0, FALSE, DESKTOP_SWITCHDESKTOP | GENERIC_ALL);
-+    if (input_desktop) {
-+        SetThreadDesktop(input_desktop);
-+        CloseDesktop(input_desktop);
-+    }
++    attach_input_desktop(avctx);
 +
 +    release_resource(&dda->dxgi_outdupl);
 +
@@ -62,13 +191,11 @@ index e035ac9bc4..c526df368d 100644
 +        return AVERROR_EXTERNAL;
 +    }
 +
-+    hr = IDXGIDevice_GetParent(dxgi_device, &IID_IDXGIAdapter, (void**)&dxgi_adapter);
++    ret = get_current_adapter(avctx, dxgi_device, &dxgi_adapter);
 +    IDXGIDevice_Release(dxgi_device);
 +    dxgi_device = NULL;
-+    if (FAILED(hr)) {
-+        av_log(avctx, AV_LOG_ERROR, "recover_duplication: Failed getting parent IDXGIAdapter: %lx\n", hr);
-+        return AVERROR_EXTERNAL;
-+    }
++    if (ret < 0)
++        return ret;
 +
 +    hr = IDXGIAdapter_EnumOutputs(dxgi_adapter, dda->output_idx, &dxgi_output);
 +    IDXGIAdapter_Release(dxgi_adapter);
@@ -123,23 +250,54 @@ index e035ac9bc4..c526df368d 100644
 +    return 0;
 +}
 +
-+#define DDAGRAB_MAX_RECOVERY_ATTEMPTS 8
-+
  typedef struct ConstBufferData
  {
      float width;
-@@ -699,10 +811,20 @@ static int next_frame_internal(AVFilterContext *avctx, ID3D11Texture2D **desktop
+@@ -692,6 +929,21 @@ static int next_frame_internal(AVFilterContext *avctx, ID3D11Texture2D **desktop
+     HRESULT hr;
+     int ret;
+ 
++    /* A previous call may have left dxgi_outdupl NULL after a recovery
++     * attempt failed (see below): calling AcquireNextFrame on a NULL
++     * duplication would crash, so treat "no duplication yet" the same as
++     * "duplication lost", and keep retrying rather than ever dereferencing
++     * NULL. */
++    if (!dda->dxgi_outdupl) {
++        dda->recovery_attempts++;
++        av_log(avctx, AV_LOG_WARNING,
++               "No active desktop duplication, attempting recovery (attempt %d)\n",
++               dda->recovery_attempts);
++        if (recover_duplication(avctx) < 0)
++            av_usleep(DDAGRAB_RECOVERY_RETRY_DELAY_US);
++        return AVERROR(EAGAIN);
++    }
++
+     hr = IDXGIOutputDuplication_AcquireNextFrame(
+         dda->dxgi_outdupl,
+         dda->time_timeout,
+@@ -699,10 +951,31 @@ static int next_frame_internal(AVFilterContext *avctx, ID3D11Texture2D **desktop
          &desktop_resource);
      if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
          return AVERROR(EAGAIN);
-+    } else if ((hr == DXGI_ERROR_ACCESS_LOST || hr == E_ACCESSDENIED || hr == DXGI_ERROR_INVALID_CALL) &&
-+               dda->recovery_attempts < DDAGRAB_MAX_RECOVERY_ATTEMPTS) {
-+        av_log(avctx, AV_LOG_WARNING,
-+               "AcquireNextFrame lost desktop duplication (%lx), attempting recovery (%d/%d)\n",
-+               hr, dda->recovery_attempts + 1, DDAGRAB_MAX_RECOVERY_ATTEMPTS);
++    } else if (hr == DXGI_ERROR_ACCESS_LOST || hr == E_ACCESSDENIED || hr == DXGI_ERROR_INVALID_CALL) {
++        /* Keep retrying indefinitely (returning EAGAIN, never a fatal
++         * error): this is expected to happen every time a UAC prompt (or
++         * any other secure desktop transition) is shown, and an unprivileged
++         * caller has no way to avoid triggering it or know how long the
++         * user will take to respond, so losing the duplication here must
++         * never kill the whole filtergraph -- it should just look like "no
++         * new frame yet" until the desktop switch resolves itself, however
++         * long that takes. A failed recover_duplication() call is
++         * intentionally NOT fatal: DuplicateOutput(1) commonly fails with
++         * E_ACCESSDENIED for a brief moment right after a desktop switch,
++         * before Windows finishes restoring the normal desktop's access
++         * rights, and retrying a bit later succeeds. */
 +        dda->recovery_attempts++;
++        av_log(avctx, AV_LOG_WARNING,
++               "AcquireNextFrame lost desktop duplication (%lx), attempting recovery (attempt %d)\n",
++               hr, dda->recovery_attempts);
 +        if (recover_duplication(avctx) < 0)
-+            return AVERROR_EXTERNAL;
++            av_usleep(DDAGRAB_RECOVERY_RETRY_DELAY_US);
 +        return AVERROR(EAGAIN);
      } else if (FAILED(hr)) {
          av_log(avctx, AV_LOG_ERROR, "AcquireNextFrame failed: %lx\n", hr);
@@ -149,24 +307,27 @@ index e035ac9bc4..c526df368d 100644
  
      if (dda->draw_mouse) {
          ret = update_mouse_pointer(avctx, &frame_info);
-@@ -1192,7 +1314,20 @@ static int ddagrab_request_frame(AVFilterLink *outlink)
+@@ -1192,7 +1465,23 @@ static int ddagrab_request_frame(AVFilterLink *outlink)
      release_resource(&cur_texture);
  
      hr = IDXGIOutputDuplication_ReleaseFrame(dda->dxgi_outdupl);
 -    if (FAILED(hr)) {
-+    if ((hr == DXGI_ERROR_ACCESS_LOST || hr == E_ACCESSDENIED || hr == DXGI_ERROR_INVALID_CALL) &&
-+        dda->recovery_attempts < DDAGRAB_MAX_RECOVERY_ATTEMPTS) {
-+        av_log(avctx, AV_LOG_WARNING,
-+               "ReleaseFrame lost desktop duplication (%lx), attempting recovery (%d/%d)\n",
-+               hr, dda->recovery_attempts + 1, DDAGRAB_MAX_RECOVERY_ATTEMPTS);
-+        dda->recovery_attempts++;
-+        if (recover_duplication(avctx) < 0) {
-+            ret = AVERROR_EXTERNAL;
-+            goto fail;
-+        }
++    if (hr == DXGI_ERROR_ACCESS_LOST || hr == E_ACCESSDENIED || hr == DXGI_ERROR_INVALID_CALL) {
 +        /* The frame was already copied into `frame` above; only the
-+         * duplication handle itself was stale, so this frame is still
-+         * good to deliver. */
++         * duplication handle itself went stale (typically a UAC/secure
++         * desktop transition, which an unprivileged process cannot avoid
++         * triggering), so this frame is still good to deliver regardless of
++         * whether recovery succeeds right now. If recover_duplication()
++         * fails, dxgi_outdupl is left NULL; the NULL-guard at the top of
++         * next_frame_internal() picks up recovery again (returning EAGAIN,
++         * never fatal, with its own retry delay) on every subsequent call,
++         * indefinitely. No delay is added here so as to not hold up
++         * delivering the frame that was already captured. */
++        dda->recovery_attempts++;
++        av_log(avctx, AV_LOG_WARNING,
++               "ReleaseFrame lost desktop duplication (%lx), attempting recovery (attempt %d)\n",
++               hr, dda->recovery_attempts);
++        recover_duplication(avctx);
 +    } else if (FAILED(hr)) {
          av_log(avctx, AV_LOG_ERROR, "DDA ReleaseFrame failed!\n");
          ret = AVERROR_EXTERNAL;

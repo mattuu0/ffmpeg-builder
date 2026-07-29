@@ -173,7 +173,7 @@ RUN set -eux; \
            --enable-encoder=hevc_amf ) \
       --extra-cflags="-Os -ffunction-sections -fdata-sections" \
       --extra-ldflags="-Wl,--gc-sections -static-libgcc -static-libstdc++" \
-      --extra-libs="-Wl,-Bstatic,-lwinpthread,-Bdynamic"
+      --extra-libs="-ldxgi -Wl,-Bstatic,-lwinpthread,-Bdynamic"
 
 RUN make -j"$(nproc)" && make install
 
@@ -203,3 +203,11 @@ RUN set -eux; \
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then STRIP=x86_64-w64-mingw32-strip; else STRIP=aarch64-w64-mingw32-strip; fi; \
     "$STRIP" --strip-unneeded /dist/bin/* /dist/lib/*.dll || true
+
+# ddagrab の手動検証用テストスクリプト。bin/ と同階層に置き、ダブルクリック
+# (.py が Python に関連付けられている環境) または `python test-ddagrab-record.py`
+# で bin/ffmpeg.exe を直接使って H.264/MP4 録画を試せるようにする。
+# .py が関連付けられていない環境でも確実にダブルクリック起動できるよう、
+# py ランチャー/python コマンドを順に試す .bat ラッパーも同梱する。
+COPY scripts/test-ddagrab-record.py /dist/test-ddagrab-record.py
+COPY scripts/run-test-ddagrab-record.bat /dist/run-test-ddagrab-record.bat
