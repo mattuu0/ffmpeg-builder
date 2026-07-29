@@ -238,6 +238,8 @@ RUN set -eux; \
       --enable-muxer=matroska \
       --enable-muxer=mpegts \
       --enable-muxer=flv \
+      --enable-muxer=h264 \
+      --enable-muxer=hevc \
       --enable-parser=h264 \
       --enable-parser=hevc \
       --enable-parser=opus \
