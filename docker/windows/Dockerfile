@@ -89,6 +89,12 @@ RUN set -eux; \
 # git clone of the tag -- the opus git tree requires autoreconf (autoconf/
 # automake/libtool, and a network fetch of the download-the-latest-model
 # tool) to produce configure, none of which are installed in this image.
+#
+# arm64 needs --disable-rtcd: opus's ARM NEON run-time CPU detection
+# (celt/arm/armcpu.c) has no implementation for the Windows-on-ARM target
+# llvm-mingw builds for, so it fails to compile ("no CPU detection method
+# available for your platform") unless run-time CPU detection is disabled
+# in favor of the compile-time-selected NEON feature set.
 RUN set -eux; \
     if [ "$ARCH" = "amd64" ]; then \
       MINGW_PREFIX=x86_64-w64-mingw32; \
@@ -100,6 +106,7 @@ RUN set -eux; \
     tar -xzf /tmp/opus.tar.gz -C /tmp/opus --strip-components=1; \
     rm /tmp/opus.tar.gz; \
     cd /tmp/opus; \
+    if [ "$ARCH" = "arm64" ]; then EXTRA_OPUS_FLAGS="--disable-rtcd"; else EXTRA_OPUS_FLAGS=""; fi; \
     CFLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" ./configure \
       --host="${MINGW_PREFIX}" \
       --prefix="/usr/${MINGW_PREFIX}" \
@@ -107,7 +114,8 @@ RUN set -eux; \
       --enable-static \
       --disable-doc \
       --disable-extra-programs \
-      --with-pic; \
+      --with-pic \
+      $EXTRA_OPUS_FLAGS; \
     make -j"$(nproc)" && make install; \
     cd /build && rm -rf /tmp/opus
 
