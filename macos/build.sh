@@ -13,8 +13,14 @@ DIST_DIR="${REPO_ROOT}/dist/macos/${ARCH}"
 BUILD_TMP="$(mktemp -d)"
 trap 'rm -rf "$BUILD_TMP"' EXIT
 
-command -v brew >/dev/null 2>&1 || { echo "Homebrew is required" >&2; exit 1; }
-brew install nasm pkg-config meson ninja
+# Use the Apple Silicon Homebrew prefix explicitly. On a Mac that also has
+# an Intel Homebrew installed at /usr/local (e.g. via Rosetta), that one may
+# come first on PATH — its bottles are x86_64 and would produce an x86_64
+# openh264 that can't link against this arm64 ffmpeg build.
+BREW="/opt/homebrew/bin/brew"
+command -v "$BREW" >/dev/null 2>&1 || { echo "Apple Silicon Homebrew (/opt/homebrew) is required" >&2; exit 1; }
+"$BREW" install nasm pkg-config meson ninja
+export PATH="/opt/homebrew/bin:/opt/homebrew/opt/pkgconf/bin:${PATH}"
 
 # openh264 (BSD-licensed H.264 software encoder), used as a fallback encoder
 # alongside VideoToolbox. Installed into a local prefix rather than
@@ -23,6 +29,14 @@ OPENH264_PREFIX="${BUILD_TMP}/openh264-install"
 git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git "${BUILD_TMP}/openh264"
 meson setup "${BUILD_TMP}/openh264/build" "${BUILD_TMP}/openh264" --prefix="$OPENH264_PREFIX" --libdir=lib
 ninja -C "${BUILD_TMP}/openh264/build" install
+
+# Rewrite the dylib's own install name (embedded at link time as the
+# absolute build-tmp path) to an @rpath-relative one now, before ffmpeg
+# links against it — otherwise ffmpeg/libavcodec bake in that absolute
+# temp path, which no longer exists once this script's trap removes
+# BUILD_TMP, and the resulting binary fails to load on any machine.
+OPENH264_DYLIB="$(find "${OPENH264_PREFIX}/lib" -name 'libopenh264.*.dylib' ! -type l)"
+install_name_tool -id "@rpath/$(basename "$OPENH264_DYLIB")" "$OPENH264_DYLIB"
 
 # libopus (BSD-licensed) for Opus audio encode/decode. Uses the release
 # tarball (ships a pre-generated ./configure) rather than a git clone of the
@@ -97,11 +111,18 @@ cd "$FFMPEG_SRC"
   --enable-encoder=libopus \
   --enable-decoder=libopus \
   --extra-cflags="-Os -ffunction-sections -fdata-sections" \
-  --extra-ldflags="-Wl,-dead_strip -L${OPENH264_PREFIX}/lib -L${OPUS_PREFIX}/lib -Wl,-rpath,${OPENH264_PREFIX}/lib" \
+  --extra-ldflags="-Wl,-dead_strip -L${OPENH264_PREFIX}/lib -L${OPUS_PREFIX}/lib -Wl,-rpath,@executable_path/../lib" \
   --extra-libs="-lm"
 
 make -j"$(sysctl -n hw.ncpu)"
 make install
+
+# libopenh264 is a shared library (opus is statically linked above), so the
+# dylib itself must ship alongside the ffmpeg binary — the rpath above points
+# at @executable_path/../lib, not the temporary build prefix, which is
+# deleted when this script exits.
+mkdir -p "${DIST_DIR}/lib"
+cp -L "${OPENH264_PREFIX}"/lib/libopenh264*.dylib "${DIST_DIR}/lib/"
 
 strip -x "${DIST_DIR}/bin/ffmpeg"
 
