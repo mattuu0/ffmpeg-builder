@@ -82,6 +82,7 @@ cd "$FFMPEG_SRC"
   --enable-protocol=rtmp \
   --enable-protocol=rtp \
   --enable-demuxer=rawvideo \
+  --enable-decoder=rawvideo \
   --enable-muxer=rawvideo \
   --enable-muxer=mp4 \
   --enable-muxer=mov \
