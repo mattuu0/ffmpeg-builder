@@ -461,10 +461,10 @@ index 0000000000..ec39d6b631
 +}
 diff --git a/fftools/ffmpeg_idr_control.h b/fftools/ffmpeg_idr_control.h
 new file mode 100644
-index 0000000000..dc6cc25132
+index 0000000000..2722aec5e0
 --- /dev/null
 +++ b/fftools/ffmpeg_idr_control.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,51 @@
 +/*
 + * External IDR/keyframe force control interface.
 + *
@@ -485,6 +485,8 @@ index 0000000000..dc6cc25132
 +
 +#ifndef FFTOOLS_FFMPEG_IDR_CONTROL_H
 +#define FFTOOLS_FFMPEG_IDR_CONTROL_H
++
++#include <stdint.h>
 +
 +/*
 + * Starts the listener thread if idr_control_socket_path (declared in
