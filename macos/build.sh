@@ -55,8 +55,11 @@ mkdir "${BUILD_TMP}/opus/build"
 # requirement governing ffmpeg's own libs).
 LIBVPX_PREFIX="${BUILD_TMP}/libvpx-install"
 git clone --depth 1 --branch v1.15.0 https://github.com/webmproject/libvpx.git "${BUILD_TMP}/libvpx"
-mkdir "${BUILD_TMP}/libvpx/build"
-( cd "${BUILD_TMP}/libvpx/build" && ../configure --target=arm64-darwin20-gcc --prefix="$LIBVPX_PREFIX" --disable-shared --enable-static --disable-examples --disable-unit-tests --disable-tools --disable-docs --enable-vp9 --disable-vp8 --enable-pic && make -j"$(sysctl -n hw.ncpu)" && make install )
+# libvpx's repo already ships its own top-level build/ directory (unrelated
+# to our out-of-tree build dir), so use a differently-named directory here
+# to avoid colliding with it.
+mkdir "${BUILD_TMP}/libvpx/obj_out"
+( cd "${BUILD_TMP}/libvpx/obj_out" && ../configure --target=arm64-darwin20-gcc --prefix="$LIBVPX_PREFIX" --disable-shared --enable-static --disable-examples --disable-unit-tests --disable-tools --disable-docs --enable-vp9 --disable-vp8 --enable-pic && make -j"$(sysctl -n hw.ncpu)" && make install )
 
 export PKG_CONFIG_PATH="${OPENH264_PREFIX}/lib/pkgconfig:${OPUS_PREFIX}/lib/pkgconfig:${LIBVPX_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
