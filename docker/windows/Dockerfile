@@ -119,6 +119,23 @@ RUN set -eux; \
     make -j"$(nproc)" && make install; \
     cd /build && rm -rf /tmp/opus
 
+# libvpx (BSD-licensed), cross-built for mingw, for VP9 software encode.
+# Statically linked (--disable-shared): a BSD build-time codec dependency,
+# not subject to the LGPL shared-linking requirement governing ffmpeg's own
+# libs, so unlike openh264 there's no runtime .dll to ship alongside
+# ffmpeg.exe.
+RUN set -eux; \
+    if [ "$ARCH" = "amd64" ]; then \
+      MINGW_PREFIX=x86_64-w64-mingw32; LIBVPX_TARGET=x86_64-win64-gcc; \
+    else \
+      MINGW_PREFIX=aarch64-w64-mingw32; LIBVPX_TARGET=arm64-win64-gcc; \
+    fi; \
+    git clone --depth 1 --branch v1.15.0 https://github.com/webmproject/libvpx.git /tmp/libvpx; \
+    cd /tmp/libvpx; \
+    CROSS="${MINGW_PREFIX}-" ./configure --target="$LIBVPX_TARGET" --prefix="/usr/${MINGW_PREFIX}" --disable-shared --enable-static --disable-examples --disable-unit-tests --disable-tools --disable-docs --enable-vp9 --disable-vp8 --enable-pic; \
+    make -j"$(nproc)" && make install; \
+    cd /build && rm -rf /tmp/libvpx
+
 COPY ffmpeg-src/ /build/
 
 # Apply source patches to ffmpeg-src before configuring. Patches are kept
@@ -159,6 +176,17 @@ RUN cd /build && \
      echo "wasapi-indev.patch applied successfully") || \
     (echo "FATAL: wasapi-indev.patch failed to apply -- upstream ffmpeg-src configure/libavdevice files likely changed. Manual patch rebase required." >&2; \
      cat /tmp/patch-check4.log >&2; exit 1)
+
+# Adds a runtime control interface (named pipe on Windows) that lets an
+# external process force the next encoded video frame to be an IDR/keyframe,
+# via a new -idr_control_socket <path> CLI option.
+COPY patches/idr-control-socket.patch /tmp/idr-control-socket.patch
+RUN cd /build && \
+    (git apply --check /tmp/idr-control-socket.patch 2>/tmp/patch-check5.log && \
+     git apply /tmp/idr-control-socket.patch && \
+     echo "idr-control-socket.patch applied successfully") || \
+    (echo "FATAL: idr-control-socket.patch failed to apply -- upstream ffmpeg-src/fftools likely changed. Manual patch rebase required." >&2; \
+     cat /tmp/patch-check5.log >&2; exit 1)
 
 # ---------------------------------------------------------------------------
 # configure flags — edit below to add/remove features for the Windows build.
@@ -241,9 +269,11 @@ RUN set -eux; \
       --enable-swresample \
       --enable-libopenh264 \
       --enable-libopus \
+      --enable-libvpx \
       --enable-encoder=libopenh264 \
       --enable-encoder=libopus \
       --enable-decoder=libopus \
+      --enable-encoder=libvpx_vp9 \
       $( [ "$ARCH" = "amd64" ] && echo \
            --enable-ffnvcodec \
            --enable-amf \

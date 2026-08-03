@@ -1,0 +1,540 @@
+diff --git a/fftools/Makefile b/fftools/Makefile
+index 01b16fa8f4..cb1f2e09b9 100644
+--- a/fftools/Makefile
++++ b/fftools/Makefile
+@@ -17,6 +17,7 @@ OBJS-ffmpeg +=                  \
+     fftools/ffmpeg_enc.o        \
+     fftools/ffmpeg_filter.o     \
+     fftools/ffmpeg_hw.o         \
++    fftools/ffmpeg_idr_control.o \
+     fftools/ffmpeg_mux.o        \
+     fftools/ffmpeg_mux_init.o   \
+     fftools/ffmpeg_opt.o        \
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index b394243f59..e651393037 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -82,6 +82,7 @@
+ #include "compat/android/binder.h"
+ #endif
+ #include "ffmpeg.h"
++#include "ffmpeg_idr_control.h"
+ #include "ffmpeg_sched.h"
+ #include "ffmpeg_utils.h"
+ #include "graph/graphprint.h"
+@@ -313,6 +314,8 @@ const AVIOInterruptCB int_cb = { decode_interrupt_cb, NULL };
+ 
+ static void ffmpeg_cleanup(int ret)
+ {
++    idr_control_stop();
++
+     if ((print_graphs || print_graphs_file) && nb_output_files > 0)
+         print_filtergraphs(filtergraphs, nb_filtergraphs, input_files, nb_input_files, output_files, nb_output_files);
+ 
+@@ -1027,6 +1030,14 @@ int main(int argc, char **argv)
+     android_binder_threadpool_init_if_required();
+ #endif
+ 
++    ret = idr_control_start();
++    if (ret < 0) {
++        av_log(NULL, AV_LOG_WARNING,
++               "Failed to start -idr_control_socket listener (%s); "
++               "continuing without external IDR-force support\n",
++               av_err2str(ret));
++    }
++
+     current_time = ti = get_benchmark_time_stamps();
+     ret = transcode(sch);
+     if (ret >= 0 && do_benchmark) {
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index c44aaf6032..aeed7d1690 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -599,6 +599,10 @@ typedef struct KeyframeForceCtx {
+     double       expr_const_values[FKF_NB];
+ 
+     int          dropped_keyframe;
++
++    // last -idr_control_socket request epoch this stream has already
++    // consumed; see idr_control_consume_request() in ffmpeg_idr_control.h
++    int64_t      idr_control_last_epoch;
+ } KeyframeForceCtx;
+ 
+ typedef struct Encoder {
+@@ -749,6 +753,11 @@ extern int stdin_interaction;
+ extern AVIOContext *progress_avio;
+ extern float max_error_rate;
+ 
++// Unix domain socket (POSIX) or named pipe (Windows) path to listen on for
++// an external "force_idr" request; NULL if -idr_control_socket was not
++// passed. See fftools/ffmpeg_idr_control.h.
++extern char *idr_control_socket_path;
++
+ extern char *filter_nbthreads;
+ extern int filter_complex_nbthreads;
+ extern int filter_buffered_frames;
+diff --git a/fftools/ffmpeg_enc.c b/fftools/ffmpeg_enc.c
+index 770533035d..fa23a57223 100644
+--- a/fftools/ffmpeg_enc.c
++++ b/fftools/ffmpeg_enc.c
+@@ -20,6 +20,7 @@
+ #include <stdint.h>
+ 
+ #include "ffmpeg.h"
++#include "ffmpeg_idr_control.h"
+ 
+ #include "libavutil/avassert.h"
+ #include "libavutil/avstring.h"
+@@ -726,7 +727,7 @@ static int encode_frame(OutputFile *of, OutputStream *ost, AVFrame *frame,
+ }
+ 
+ static enum AVPictureType forced_kf_apply(void *logctx, KeyframeForceCtx *kf,
+-                                          const AVFrame *frame)
++                                          const AVFrame *frame, int ost_index)
+ {
+     double pts_time;
+ 
+@@ -765,6 +766,9 @@ static enum AVPictureType forced_kf_apply(void *logctx, KeyframeForceCtx *kf,
+     } else if (kf->type == KF_FORCE_SCD_METADATA &&
+                av_dict_get(frame->metadata, "lavfi.scd.time", NULL, 0)) {
+         goto force_keyframe;
++    } else if (idr_control_consume_request(ost_index, &kf->idr_control_last_epoch)) {
++        av_log(logctx, AV_LOG_DEBUG, "Forced keyframe via -idr_control_socket\n");
++        goto force_keyframe;
+     }
+ 
+     return AV_PICTURE_TYPE_NONE;
+@@ -795,7 +799,7 @@ static int frame_encode(OutputStream *ost, AVFrame *frame, AVPacket *pkt)
+ 
+         if (type == AVMEDIA_TYPE_VIDEO) {
+             frame->quality   = e->enc_ctx->global_quality;
+-            frame->pict_type = forced_kf_apply(e, &ost->kf, frame);
++            frame->pict_type = forced_kf_apply(e, &ost->kf, frame, ost->index);
+         } else {
+             if (!(e->enc_ctx->codec->capabilities & AV_CODEC_CAP_PARAM_CHANGE) &&
+                 e->enc_ctx->ch_layout.nb_channels != frame->ch_layout.nb_channels) {
+diff --git a/fftools/ffmpeg_idr_control.c b/fftools/ffmpeg_idr_control.c
+new file mode 100644
+index 0000000000..ec39d6b631
+--- /dev/null
++++ b/fftools/ffmpeg_idr_control.c
+@@ -0,0 +1,340 @@
++/*
++ * External IDR/keyframe force control interface.
++ *
++ * This is FFmpeg but you can freely redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Wire protocol (both transports): a client connects, writes one line of
++ * ASCII text terminated by '\n', and the connection is then closed (by
++ * either side) before the next request. Two forms are accepted:
++ *
++ *   force_idr\n           -- force an IDR on every output stream that
++ *                            hasn't already consumed this request
++ *   force_idr <n>\n        -- force an IDR only on output stream index n
++ *
++ * Requests are tracked with a monotonically increasing "epoch" counter
++ * rather than a single one-shot flag, so that multiple output streams in
++ * the same process (e.g. a high-bitrate recording output and a low-bitrate
++ * streaming output from one `ffmpeg` invocation) can each independently
++ * notice and act on the same request exactly once, regardless of which
++ * stream's encode loop happens to poll first.
++ */
++
++#include <stdatomic.h>
++#include <string.h>
++
++#include "ffmpeg_idr_control.h"
++#include "ffmpeg.h"
++
++#include "libavutil/avassert.h"
++#include "libavutil/error.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++#include "libavutil/thread.h"
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <errno.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#endif
++
++/* 0 means "no request pending yet". First real request is epoch 1. */
++static atomic_int_least64_t g_request_epoch  = 0;
++/* -1 means "broadcast to all streams", otherwise a specific OutputStream::index. */
++static atomic_int           g_request_target = -1;
++
++static pthread_t g_listener_thread;
++static int       g_thread_started = 0;
++
++#ifdef _WIN32
++static HANDLE g_pipe          = INVALID_HANDLE_VALUE;
++static HANDLE g_stop_event    = NULL;
++#else
++static int g_listen_fd        = -1;
++static int g_wakeup_pipe[2]   = { -1, -1 };
++#endif
++
++static void handle_line(const char *line)
++{
++    long target = -1;
++    const char *p = line;
++
++    if (strncmp(p, "force_idr", 9) != 0)
++        return;
++    p += 9;
++
++    while (*p == ' ' || *p == '\t')
++        p++;
++    if (*p >= '0' && *p <= '9')
++        target = strtol(p, NULL, 10);
++
++    atomic_store(&g_request_target, (int)target);
++    /* Store the target before bumping the epoch: a reader that observes the
++     * new epoch is guaranteed to see the matching target, not a stale one
++     * from a previous request (release/consume ordering via the atomic
++     * epoch increment below acts as the publication point). */
++    atomic_fetch_add(&g_request_epoch, 1);
++}
++
++#ifdef _WIN32
++
++static void *listener_main(void *arg)
++{
++    const char *path = idr_control_socket_path;
++    char buf[256];
++
++    for (;;) {
++        HANDLE pipe = CreateNamedPipeA(
++            path,
++            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
++            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
++            PIPE_UNLIMITED_INSTANCES,
++            0, sizeof(buf), 0, NULL);
++        OVERLAPPED ov = { 0 };
++        HANDLE waitObjs[2];
++        DWORD wait;
++        BOOL connected;
++
++        if (pipe == INVALID_HANDLE_VALUE)
++            break;
++        g_pipe = pipe;
++
++        ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
++        connected = ConnectNamedPipe(pipe, &ov);
++        if (!connected && GetLastError() == ERROR_IO_PENDING) {
++            waitObjs[0] = ov.hEvent;
++            waitObjs[1] = g_stop_event;
++            wait = WaitForMultipleObjects(2, waitObjs, FALSE, INFINITE);
++            if (wait != WAIT_OBJECT_0) {
++                CloseHandle(ov.hEvent);
++                CloseHandle(pipe);
++                break; /* stop requested */
++            }
++        } else if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
++            CloseHandle(ov.hEvent);
++            CloseHandle(pipe);
++            continue;
++        }
++        CloseHandle(ov.hEvent);
++
++        {
++            DWORD n = 0;
++            if (ReadFile(pipe, buf, sizeof(buf) - 1, &n, NULL) && n > 0) {
++                buf[n] = '\0';
++                handle_line(buf);
++            }
++        }
++
++        DisconnectNamedPipe(pipe);
++        CloseHandle(pipe);
++        g_pipe = INVALID_HANDLE_VALUE;
++    }
++
++    return NULL;
++}
++
++int idr_control_start(void)
++{
++    if (!idr_control_socket_path)
++        return 0;
++
++    g_stop_event = CreateEventA(NULL, TRUE, FALSE, NULL);
++    if (!g_stop_event)
++        return AVERROR_EXTERNAL;
++
++    if (pthread_create(&g_listener_thread, NULL, listener_main, NULL) != 0) {
++        CloseHandle(g_stop_event);
++        g_stop_event = NULL;
++        return AVERROR_EXTERNAL;
++    }
++    g_thread_started = 1;
++
++    return 0;
++}
++
++void idr_control_stop(void)
++{
++    if (!g_thread_started)
++        return;
++
++    SetEvent(g_stop_event);
++    /* Unblock a listener that is already parked in a blocking ConnectNamedPipe
++     * (no pending overlapped I/O yet) by connecting to our own pipe once. */
++    if (idr_control_socket_path) {
++        HANDLE h = CreateFileA(idr_control_socket_path, GENERIC_WRITE, 0, NULL,
++                                OPEN_EXISTING, 0, NULL);
++        if (h != INVALID_HANDLE_VALUE)
++            CloseHandle(h);
++    }
++
++    pthread_join(g_listener_thread, NULL);
++    g_thread_started = 0;
++    CloseHandle(g_stop_event);
++    g_stop_event = NULL;
++}
++
++#else /* POSIX */
++
++static void *listener_main(void *arg)
++{
++    char buf[256];
++
++    for (;;) {
++        struct pollfd pfds[2];
++        int nready;
++
++        pfds[0].fd = g_listen_fd;
++        pfds[0].events = POLLIN;
++        pfds[1].fd = g_wakeup_pipe[0];
++        pfds[1].events = POLLIN;
++
++        nready = poll(pfds, 2, -1);
++        if (nready < 0) {
++            if (errno == EINTR)
++                continue;
++            break;
++        }
++
++        if (pfds[1].revents & POLLIN)
++            break; /* stop requested */
++
++        if (pfds[0].revents & POLLIN) {
++            int conn = accept(g_listen_fd, NULL, NULL);
++            if (conn >= 0) {
++                ssize_t n = read(conn, buf, sizeof(buf) - 1);
++                if (n > 0) {
++                    buf[n] = '\0';
++                    handle_line(buf);
++                }
++                close(conn);
++            }
++        }
++    }
++
++    return NULL;
++}
++
++int idr_control_start(void)
++{
++    struct sockaddr_un addr;
++    int fd;
++
++    if (!idr_control_socket_path)
++        return 0;
++
++    if (strlen(idr_control_socket_path) >= sizeof(addr.sun_path))
++        return AVERROR(ENAMETOOLONG);
++
++    fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd < 0)
++        return AVERROR(errno);
++
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strcpy(addr.sun_path, idr_control_socket_path);
++
++    /* Remove a stale socket file left behind by a prior unclean shutdown
++     * (e.g. kill -9) so bind() below doesn't fail with EADDRINUSE. */
++    unlink(idr_control_socket_path);
++
++    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
++        int err = errno;
++        close(fd);
++        return AVERROR(err);
++    }
++
++    if (listen(fd, 1) < 0) {
++        int err = errno;
++        close(fd);
++        unlink(idr_control_socket_path);
++        return AVERROR(err);
++    }
++
++    if (pipe(g_wakeup_pipe) < 0) {
++        int err = errno;
++        close(fd);
++        unlink(idr_control_socket_path);
++        return AVERROR(err);
++    }
++
++    g_listen_fd = fd;
++
++    if (pthread_create(&g_listener_thread, NULL, listener_main, NULL) != 0) {
++        close(g_listen_fd);
++        g_listen_fd = -1;
++        close(g_wakeup_pipe[0]);
++        close(g_wakeup_pipe[1]);
++        g_wakeup_pipe[0] = g_wakeup_pipe[1] = -1;
++        unlink(idr_control_socket_path);
++        return AVERROR(errno);
++    }
++    g_thread_started = 1;
++
++    return 0;
++}
++
++void idr_control_stop(void)
++{
++    if (!g_thread_started)
++        return;
++
++    /* Wake the poll() in listener_main() out of its blocking wait -- do not
++     * use pthread_cancel(), which could leave the listening socket or the
++     * wakeup pipe in an inconsistent state if it fires mid-syscall. */
++    if (g_wakeup_pipe[1] >= 0) {
++        char c = 0;
++        ssize_t ignored = write(g_wakeup_pipe[1], &c, 1);
++        (void)ignored;
++    }
++
++    pthread_join(g_listener_thread, NULL);
++    g_thread_started = 0;
++
++    if (g_listen_fd >= 0) {
++        close(g_listen_fd);
++        g_listen_fd = -1;
++    }
++    if (g_wakeup_pipe[0] >= 0) {
++        close(g_wakeup_pipe[0]);
++        close(g_wakeup_pipe[1]);
++        g_wakeup_pipe[0] = g_wakeup_pipe[1] = -1;
++    }
++    if (idr_control_socket_path)
++        unlink(idr_control_socket_path);
++}
++
++#endif /* _WIN32 */
++
++int idr_control_consume_request(int ost_index, int64_t *last_seen_epoch)
++{
++    int64_t epoch = atomic_load(&g_request_epoch);
++
++    if (epoch == 0 || epoch == *last_seen_epoch)
++        return 0;
++
++    {
++        int target = atomic_load(&g_request_target);
++        if (target != -1 && target != ost_index)
++            return 0;
++    }
++
++    *last_seen_epoch = epoch;
++    return 1;
++}
+diff --git a/fftools/ffmpeg_idr_control.h b/fftools/ffmpeg_idr_control.h
+new file mode 100644
+index 0000000000..dc6cc25132
+--- /dev/null
++++ b/fftools/ffmpeg_idr_control.h
+@@ -0,0 +1,49 @@
++/*
++ * External IDR/keyframe force control interface.
++ *
++ * This is FFmpeg but you can freely redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef FFTOOLS_FFMPEG_IDR_CONTROL_H
++#define FFTOOLS_FFMPEG_IDR_CONTROL_H
++
++/*
++ * Starts the listener thread if idr_control_socket_path (declared in
++ * ffmpeg.h) is non-NULL. Returns 0 on success, including the no-op case
++ * where no path was configured. Returns a negative AVERROR on failure to
++ * start the listener (does not abort the process -- callers should log and
++ * continue without the feature rather than fail the whole run).
++ */
++int idr_control_start(void);
++
++/*
++ * Signals the listener thread to stop and joins it. Safe to call even if
++ * idr_control_start() was a no-op or was never called. Idempotent.
++ */
++void idr_control_stop(void);
++
++/*
++ * Checks whether output stream `ost_index` (the OutputStream::index of the
++ * stream asking) has a pending forced-IDR request it has not yet consumed,
++ * and if so marks it as consumed for that stream and returns 1. Returns 0
++ * otherwise. Thread-safe; safe to call every frame.
++ *
++ * A request targeting a specific stream index only ever satisfies that one
++ * stream. A request with no target (broadcast) satisfies every stream that
++ * has not yet consumed it, once each.
++ */
++int idr_control_consume_request(int ost_index, int64_t *last_seen_epoch);
++
++#endif /* FFTOOLS_FFMPEG_IDR_CONTROL_H */
+diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
+index 2c362c64af..7edf07f32b 100644
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -79,6 +79,7 @@ char *print_graphs_file = NULL;
+ char *print_graphs_format = NULL;
+ int auto_conversion_filters = 1;
+ int64_t stats_period = 500000;
++char *idr_control_socket_path = NULL;
+ 
+ 
+ static int file_overwrite     = 0;
+@@ -1647,6 +1648,11 @@ const OptionDef options[] = {
+     { "benchmark_all",          OPT_TYPE_BOOL, OPT_EXPERT,
+         { &do_benchmark_all },
+       "add timings for each task" },
++    { "idr_control_socket",     OPT_TYPE_STRING, OPT_EXPERT,
++        { &idr_control_socket_path },
++        "Unix domain socket (POSIX) or named pipe (Windows) path to listen "
++        "on for an external \"force_idr\" request that forces the next "
++        "encoded video frame to be an IDR/keyframe", "path" },
+     { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+         { .func_arg = opt_progress },
+       "write program-readable progress information", "url" },

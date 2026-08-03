@@ -49,9 +49,37 @@ tar -xzf "${BUILD_TMP}/opus.tar.gz" -C "${BUILD_TMP}/opus" --strip-components=1
 mkdir "${BUILD_TMP}/opus/build"
 ( cd "${BUILD_TMP}/opus/build" && ../configure --prefix="$OPUS_PREFIX" --disable-shared --enable-static --disable-doc --disable-extra-programs --with-pic && make -j"$(sysctl -n hw.ncpu)" && make install )
 
-export PKG_CONFIG_PATH="${OPENH264_PREFIX}/lib/pkgconfig:${OPUS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+# libvpx (BSD-licensed) for VP9 software encode, statically linked (unlike
+# openh264, no dylib needs to ship alongside the ffmpeg binary since this is
+# a BSD build-time codec dependency, not subject to the LGPL shared-linking
+# requirement governing ffmpeg's own libs).
+LIBVPX_PREFIX="${BUILD_TMP}/libvpx-install"
+git clone --depth 1 --branch v1.15.0 https://github.com/webmproject/libvpx.git "${BUILD_TMP}/libvpx"
+mkdir "${BUILD_TMP}/libvpx/build"
+( cd "${BUILD_TMP}/libvpx/build" && ../configure --target=arm64-darwin20-gcc --prefix="$LIBVPX_PREFIX" --disable-shared --enable-static --disable-examples --disable-unit-tests --disable-tools --disable-docs --enable-vp9 --disable-vp8 --enable-pic && make -j"$(sysctl -n hw.ncpu)" && make install )
+
+export PKG_CONFIG_PATH="${OPENH264_PREFIX}/lib/pkgconfig:${OPUS_PREFIX}/lib/pkgconfig:${LIBVPX_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 cd "$FFMPEG_SRC"
+
+# Apply source patches (see docker/*/Dockerfile for the Linux/Windows
+# equivalent of this step; kept in sync manually since this script doesn't
+# run inside a Dockerfile). Reset to a pristine checkout first since this
+# script operates directly on the submodule's working tree (not a COPY'd
+# throwaway copy like the Dockerfiles), so a previous run's applied patches
+# must not still be present.
+git checkout -- .
+git clean -fd
+for patch in idr-control-socket; do
+  patch_file="${REPO_ROOT}/patches/${patch}.patch"
+  if ! git apply --check "$patch_file" 2>"${BUILD_TMP}/patch-check.log"; then
+    echo "FATAL: ${patch}.patch failed to apply -- upstream ffmpeg-src/fftools likely changed. Manual patch rebase required." >&2
+    cat "${BUILD_TMP}/patch-check.log" >&2
+    exit 1
+  fi
+  git apply "$patch_file"
+  echo "${patch}.patch applied successfully"
+done
 
 # ---------------------------------------------------------------------------
 # configure flags — edit below to add/remove features for the macOS build.
@@ -106,13 +134,15 @@ cd "$FFMPEG_SRC"
   --enable-videotoolbox \
   --enable-libopenh264 \
   --enable-libopus \
+  --enable-libvpx \
   --enable-encoder=h264_videotoolbox \
   --enable-encoder=hevc_videotoolbox \
   --enable-encoder=libopenh264 \
   --enable-encoder=libopus \
   --enable-decoder=libopus \
+  --enable-encoder=libvpx_vp9 \
   --extra-cflags="-Os -ffunction-sections -fdata-sections" \
-  --extra-ldflags="-Wl,-dead_strip -L${OPENH264_PREFIX}/lib -L${OPUS_PREFIX}/lib -Wl,-rpath,@executable_path/../lib" \
+  --extra-ldflags="-Wl,-dead_strip -L${OPENH264_PREFIX}/lib -L${OPUS_PREFIX}/lib -L${LIBVPX_PREFIX}/lib -Wl,-rpath,@executable_path/../lib" \
   --extra-libs="-lm"
 
 make -j"$(sysctl -n hw.ncpu)"

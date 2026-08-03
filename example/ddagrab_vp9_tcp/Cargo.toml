@@ -1,0 +1,11 @@
+[package]
+name = "ddagrab_vp9_tcp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ddagrab_vp9_tcp"
+path = "src/main.rs"
+
+[dependencies]
+ctrlc = "3"

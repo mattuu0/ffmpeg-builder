@@ -90,7 +90,40 @@ RUN set -eux; \
     (cd build-arm64 && CFLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" ../configure --host=aarch64-linux-gnu --prefix=/usr/aarch64-linux-gnu --disable-shared --enable-static --disable-doc --disable-extra-programs --with-pic && make -j"$(nproc)" && make install); \
     cd /build && rm -rf /tmp/opus
 
+# libvpx (BSD-licensed) for VP9 software encode. Uses the git tag directly --
+# unlike opus, libvpx's repo ships a pre-generated ./configure so no
+# autoreconf step is needed. Built as a static lib (--disable-shared): it's a
+# BSD build-time codec dependency, not something subject to the LGPL
+# shared-linking requirement that governs ffmpeg's own libs, so there's no
+# runtime .so to ship alongside the ffmpeg binary (unlike openh264).
+RUN set -eux; \
+    git clone --depth 1 --branch v1.15.0 https://github.com/webmproject/libvpx.git /tmp/libvpx; \
+    cd /tmp/libvpx; \
+    mkdir build-amd64; \
+    (cd build-amd64 && ../configure --target=x86_64-linux-gcc --prefix=/usr --disable-shared --enable-static --disable-examples --disable-unit-tests --disable-tools --disable-docs --enable-vp9 --disable-vp8 --enable-pic && make -j"$(nproc)" && make install); \
+    mkdir build-arm64; \
+    (cd build-arm64 && CROSS=aarch64-linux-gnu- ../configure --target=arm64-linux-gcc --prefix=/usr/aarch64-linux-gnu --disable-shared --enable-static --disable-examples --disable-unit-tests --disable-tools --disable-docs --enable-vp9 --disable-vp8 --enable-pic && make -j"$(nproc)" && make install); \
+    cd /build && rm -rf /tmp/libvpx
+
 COPY ffmpeg-src/ /build/
+
+# Apply source patches to ffmpeg-src before configuring. Patches are kept
+# outside the ffmpeg-src submodule and re-applied fresh on every build so
+# they survive the daily automated submodule version bumps (see
+# .github/workflows/check-ffmpeg-release.yml); if upstream changes enough to
+# break a patch, fail the build loudly here rather than silently shipping
+# unpatched behavior.
+#
+# Only idr-control-socket.patch applies here: the ddagrab/wasapi patches
+# touch Windows-only (DXGI/WASAPI) code and are applied in
+# docker/windows/Dockerfile instead.
+COPY patches/idr-control-socket.patch /tmp/idr-control-socket.patch
+RUN cd /build && \
+    (git apply --check /tmp/idr-control-socket.patch 2>/tmp/patch-check.log && \
+     git apply /tmp/idr-control-socket.patch && \
+     echo "idr-control-socket.patch applied successfully") || \
+    (echo "FATAL: idr-control-socket.patch failed to apply -- upstream ffmpeg-src/fftools likely changed. Manual patch rebase required." >&2; \
+     cat /tmp/patch-check.log >&2; exit 1)
 
 # ---------------------------------------------------------------------------
 # configure flags — edit below to add/remove features for the Linux build.
@@ -153,6 +186,8 @@ RUN set -eux; \
       --enable-libopus \
       --enable-encoder=libopus \
       --enable-decoder=libopus \
+      --enable-libvpx \
+      --enable-encoder=libvpx_vp9 \
       --extra-cflags=\"-Os -ffunction-sections -fdata-sections\" \
       --extra-ldflags=\"-Wl,--gc-sections\" \
       --extra-libs=\"-lm\" \

@@ -1,3 +1,5 @@
 .claude/
 dist/
 test/
+example/ddagrab_vp9_tcp/target/
+example/ddagrab_vp9_tcp/__pycache__/
